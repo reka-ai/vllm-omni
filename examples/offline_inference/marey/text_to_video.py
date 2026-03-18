@@ -77,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default="marey_output.mp4", help="Output video path.")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"], help="Compute dtype.")
     parser.add_argument("--tp", type=int, default=1, help="Tensor parallel size. Use torchrun --nproc_per_node=N for tp > 1.")
+    parser.add_argument("--diag", action="store_true", help="Enable DIAG / BLOCK_DIAG diagnostic output from the transformer.")
     return parser.parse_args()
 
 
@@ -726,6 +727,7 @@ def main():
         print(f"  Steps:      {args.steps}, CFG: {args.guidance_scale}")
         print(f"  Dtype:      {args.dtype}")
         print(f"  TP:         {args.tp}")
+        print(f"  Diag:       {args.diag}")
         print(f"{'=' * 60}\n")
 
     # Load config
@@ -799,7 +801,7 @@ def main():
     if rank == 0 and extra_features:
         print(f"Extra features for inference: {list(extra_features.keys())}")
 
-    if rank == 0:
+    if rank == 0 and args.diag:
         transformer._diag = True
     t_model = time.perf_counter() - t0
     if rank == 0:
