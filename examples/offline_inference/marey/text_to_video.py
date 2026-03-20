@@ -48,11 +48,15 @@ DEFAULT_TRANSFORMER_WEIGHTS = (
 DEFAULT_VAE_WEIGHTS = "/app/wlam/models/checkpoints/marey/vae/epoch_4_step2819000.ckpt"
 
 
-# Matches DEFAULT_NEGATIVE_PROMPT from opensora schedulers/rf/__init__.py
 DEFAULT_NEGATIVE_PROMPT = (
-    "Detailed description: <ungraded>, <timelapse>, <scene cut>, <timelapse> "
-    "blurry, distortion, low quality, low resolution, jpeg artifacts, artifacts, "
-    "logo, sign, watermark, overlay text, text, mark, "
+    "<synthetic> <scene cut> gopro, bright, contrast, static, overexposed, bright, "
+    "vignette, artifacts, still, noise, texture, scanlines, videogame, 360 camera, "
+    "VR, transition, flare, saturation, distorted, warped, wide angle, contrast, "
+    "saturated, vibrant, glowing, cross dissolve, texture, videogame, saturation, "
+    "cheesy, ugly hands, mutated hands, mutant, disfigured, extra fingers, blown out, "
+    "horrible, blurry, worst quality, bad, transition, dissolve, cross-dissolve, melt, "
+    "fade in, fade out, wobbly, weird, low quality, plastic, stock footage, video camera, "
+    "boring, static"
 )
 
 
@@ -82,7 +86,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance-every-n-steps", type=int, default=2,
                         help="Apply guidance every N steps during the middle phase.")
     parser.add_argument("--clip-value", type=float, default=10.0, help="Clamp predicted x0 to [-clip, clip]. 0 to disable.")
-    parser.add_argument("--flow-shift", type=float, default=None, help="Rectified flow shift (None=read from config).")
+    parser.add_argument("--quality-guidance", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable quality guidance (cond=0, uncond=9 for dover/aesthetics scores). Matches reference.")
+    parser.add_argument("--flow-shift", type=float, default=3.0, help="Rectified flow shift (default 3.0 matches reference inference CLI).")
     parser.add_argument("--fps", type=int, default=24, help="Output video FPS.")
     parser.add_argument("--output", type=str, default="marey_output.mp4", help="Output video path.")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"], help="Compute dtype.")
@@ -606,6 +612,7 @@ def generate(
     vae_downsample_factors: tuple[int, int, int] = (4, 16, 16),
     clip_value: float | None = None,
     extra_features: dict[str, torch.Tensor] | None = None,
+    uncond_extra_features: dict[str, torch.Tensor] | None = None,
     guidance_schedule: list[float] | None = None,
     skip_uncond: bool = False,
 ) -> torch.Tensor:
@@ -630,7 +637,9 @@ def generate(
     in_channels = transformer.in_channels
     shape = (1, in_channels, num_latent_frames, latent_h, latent_w)
 
-    z = torch.randn(shape, generator=generator, device="cpu", dtype=torch.float32).to(device)
+    z_zeros = torch.zeros(shape, device=device, dtype=dtype)
+    z = torch.randn_like(z_zeros)
+    del z_zeros
 
     height_t = torch.tensor([height], device=device, dtype=dtype)
     width_t = torch.tensor([width], device=device, dtype=dtype)
@@ -647,7 +656,9 @@ def generate(
             f"{f' ({sched_desc}, skip_uncond={skip_uncond})' if has_neg else ''}"
         )
 
-    def _model_forward(z_in, t_in, text_emb, vec_cond, text_mask=None):
+    _uncond_ef = uncond_extra_features if uncond_extra_features is not None else extra_features
+
+    def _model_forward(z_in, t_in, text_emb, vec_cond, text_mask=None, ef=None):
         raw = transformer(
             hidden_states=z_in.to(dtype),
             timestep=t_in,
@@ -657,7 +668,7 @@ def generate(
             height=height_t,
             width=width_t,
             fps=fps_t,
-            extra_features=extra_features,
+            extra_features=ef if ef is not None else extra_features,
             return_dict=False,
         )[0]
         if raw.shape[1] != in_channels:
@@ -675,10 +686,10 @@ def generate(
         # When skip_uncond=True and scale is 1.0, skip the unconditional pass entirely.
         use_uncond = has_neg and ((not skip_uncond) or (gs_i > 1.0))
 
-        pred_cond = _model_forward(z, t_input, prompt_embeds, vector_cond, prompt_embeds_mask)
+        pred_cond = _model_forward(z, t_input, prompt_embeds, vector_cond, prompt_embeds_mask, ef=extra_features)
 
         if use_uncond:
-            pred_uncond = _model_forward(z, t_input, negative_prompt_embeds, negative_vector_cond, negative_prompt_embeds_mask)
+            pred_uncond = _model_forward(z, t_input, negative_prompt_embeds, negative_vector_cond, negative_prompt_embeds_mask, ef=_uncond_ef)
             v_pred = pred_uncond + gs_i * (pred_cond - pred_uncond)
         else:
             v_pred = pred_cond
@@ -749,17 +760,22 @@ def save_video(frames: np.ndarray, output_path: str, fps: int = 24) -> None:
 # ---------------------------------------------------------------------------
 
 
+
 def main():
     args = parse_args()
 
     # Initialize distributed environment and TP groups
     rank, world_size = init_distributed(args.tp)
 
+    import random as _random
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dtype = dtype_map[args.dtype]
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    generator = torch.Generator(device="cpu").manual_seed(args.seed)
+    _random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    generator = None
 
     # Resolve skip_uncond early so the banner shows the actual value
     skip_uncond = args.skip_uncond
@@ -867,6 +883,16 @@ def main():
     if rank == 0 and extra_features:
         print(f"Extra features for inference: {list(extra_features.keys())}")
 
+    uncond_extra_features = None
+    if args.quality_guidance and use_cfg:
+        uncond_extra_features = dict(extra_features)
+        for qkey in ("dover_technical", "aesthetics_score_total"):
+            if qkey in extra_features:
+                uncond_extra_features[qkey] = torch.tensor([9], device=device, dtype=torch.long)
+                extra_features[qkey] = torch.tensor([0], device=device, dtype=torch.long)
+        if rank == 0:
+            print(f"Quality guidance enabled: cond quality=0, uncond quality=9")
+
     if rank == 0 and args.diag:
         transformer._diag = True
     t_model = time.perf_counter() - t0
@@ -882,6 +908,7 @@ def main():
         shift_value = args.flow_shift if args.flow_shift > 0 else None
     elif not use_ts_transform:
         shift_value = None
+    use_ts_transform = shift_value is not None
     tmin = sched_cfg.get("tmin", 0.001)
     tmax = sched_cfg.get("tmax", 1.0)
     teacher_steps = sched_cfg.get("num_sampling_steps", 100)
@@ -942,6 +969,7 @@ def main():
         vae_downsample_factors=vae_ds,
         clip_value=clip_val,
         extra_features=extra_features,
+        uncond_extra_features=uncond_extra_features,
         guidance_schedule=guidance_sched,
         skip_uncond=skip_uncond,
     )
@@ -971,7 +999,11 @@ def main():
             num_latent_t = latents.shape[2]
             num_pixel_frames = num_latent_t * vae_t_ds
             chunk = vae.frame_chunk_len
-            if chunk is not None and num_pixel_frames % chunk != 0:
+            if num_latent_t <= 1:
+                # Single latent frame → use the VAE's single-frame decode path
+                num_pixel_frames = 1
+                print("Single latent frame detected, using single-frame decode")
+            elif chunk is not None and num_pixel_frames % chunk != 0:
                 num_pixel_frames = (num_pixel_frames // chunk) * chunk
                 print(
                     f"Aligned pixel frames to {num_pixel_frames} "
