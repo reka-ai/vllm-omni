@@ -72,6 +72,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-frames", type=int, default=33, help="Number of output frames.")
     parser.add_argument("--steps", type=int, default=100, help="Number of denoising steps (reference uses 100 for distilled).")
     parser.add_argument("--guidance-scale", type=float, default=7.5, help="CFG guidance scale.")
+    parser.add_argument("--use-guidance-schedule", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use warmup/cooldown guidance schedule (matching reference RFLOW scheduler).")
+    parser.add_argument("--skip-uncond", action=argparse.BooleanOptionalAction, default=None,
+                        help="Skip unconditional prediction when guidance scale is 1.0. "
+                             "Default: auto-detect from checkpoint path (True for distilled models).")
+    parser.add_argument("--warmup-frac", type=float, default=0.24, help="Fraction of steps for guidance warmup.")
+    parser.add_argument("--cooldown-frac", type=float, default=0.36, help="Fraction of steps for guidance cooldown.")
+    parser.add_argument("--guidance-every-n-steps", type=int, default=2,
+                        help="Apply guidance every N steps during the middle phase.")
+    parser.add_argument("--clip-value", type=float, default=10.0, help="Clamp predicted x0 to [-clip, clip]. 0 to disable.")
     parser.add_argument("--flow-shift", type=float, default=None, help="Rectified flow shift (None=read from config).")
     parser.add_argument("--fps", type=int, default=24, help="Output video FPS.")
     parser.add_argument("--output", type=str, default="marey_output.mp4", help="Output video path.")
@@ -210,8 +220,12 @@ def encode_text(
     encoders: dict,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[list[torch.Tensor], torch.Tensor | None]:
-    """Encode text using UL2 (sequence), CLIP (vector), and ByT5 (quotes)."""
+) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor | None]:
+    """Encode text using UL2 (sequence), CLIP (vector), and ByT5 (quotes).
+
+    Returns (seq_cond, seq_cond_masks, vector_cond) where seq_cond_masks
+    are boolean attention masks aligned with the sequence embeddings.
+    """
     # UL2 encoding (sequence tokens)
     ul2_tokenizer = encoders["ul2_tokenizer"]
     ul2_model = encoders["ul2_model"]
@@ -222,10 +236,15 @@ def encode_text(
         padding="max_length",
         max_length=max_len,
         truncation=True,
+        return_attention_mask=True,
         return_tensors="pt",
     )
+    ul2_mask = inputs["attention_mask"].to(device, torch.bool)
     with torch.no_grad():
-        ul2_output = ul2_model(input_ids=inputs.input_ids.to(device))
+        ul2_output = ul2_model(
+            input_ids=inputs.input_ids.to(device),
+            attention_mask=inputs.attention_mask.to(device),
+        )
         ul2_seq = ul2_output.last_hidden_state.to(dtype)  # [1, 300, 4096]
 
     # CLIP encoding (pooled vector)
@@ -257,14 +276,20 @@ def encode_text(
         padding="max_length",
         max_length=byt5_max_len,
         truncation=True,
+        return_attention_mask=True,
         return_tensors="pt",
     )
+    byt5_mask = byt5_inputs["attention_mask"].to(device, torch.bool)
     with torch.no_grad():
-        byt5_output = byt5_model(input_ids=byt5_inputs.input_ids.to(device))
+        byt5_output = byt5_model(
+            input_ids=byt5_inputs.input_ids.to(device),
+            attention_mask=byt5_inputs.attention_mask.to(device),
+        )
         byt5_seq = byt5_output.last_hidden_state.to(dtype)  # [1, 70, 1536]
 
     seq_cond = [ul2_seq, byt5_seq]
-    return seq_cond, vector_cond
+    seq_cond_masks = [ul2_mask, byt5_mask]
+    return seq_cond, seq_cond_masks, vector_cond
 
 
 # ---------------------------------------------------------------------------
@@ -573,14 +598,24 @@ def generate(
     guidance_scale: float,
     negative_prompt_embeds: torch.Tensor | list[torch.Tensor] | None,
     negative_vector_cond: torch.Tensor | None = None,
+    prompt_embeds_mask: torch.Tensor | list[torch.Tensor] | None = None,
+    negative_prompt_embeds_mask: torch.Tensor | list[torch.Tensor] | None = None,
     device: torch.device = torch.device("cpu"),
     dtype: torch.dtype = torch.bfloat16,
     generator: torch.Generator | None = None,
     vae_downsample_factors: tuple[int, int, int] = (4, 16, 16),
     clip_value: float | None = None,
     extra_features: dict[str, torch.Tensor] | None = None,
+    guidance_schedule: list[float] | None = None,
+    skip_uncond: bool = False,
 ) -> torch.Tensor:
-    """Run the DDPM flow-matching denoising loop and return latents."""
+    """Run the DDPM flow-matching denoising loop and return latents.
+
+    When *guidance_schedule* is provided it overrides the constant *guidance_scale*
+    on a per-step basis.  Combined with *skip_uncond=True* this matches the
+    reference RFLOW scheduler behaviour for distilled models: the unconditional
+    forward pass is skipped entirely whenever the per-step scale is 1.0.
+    """
     vae_scale_factor_temporal = vae_downsample_factors[0]
     vae_scale_factor_spatial = vae_downsample_factors[1]
     num_train_timesteps = 1000
@@ -601,21 +636,23 @@ def generate(
     width_t = torch.tensor([width], device=device, dtype=dtype)
     fps_t = torch.tensor([24.0], device=device, dtype=dtype)
 
-    do_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+    has_neg = negative_prompt_embeds is not None
     is_main = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
 
     if is_main:
+        sched_desc = "scheduled" if guidance_schedule else f"constant scale={guidance_scale}"
         print(
             f"Denoising: {len(timesteps)} steps, latent shape {shape}, "
-            f"CFG={'on' if do_cfg else 'off'}"
-            f"{f' (constant scale={guidance_scale})' if do_cfg else ''}"
+            f"CFG={'on' if has_neg else 'off'}"
+            f"{f' ({sched_desc}, skip_uncond={skip_uncond})' if has_neg else ''}"
         )
 
-    def _model_forward(z_in, t_in, text_emb, vec_cond):
+    def _model_forward(z_in, t_in, text_emb, vec_cond, text_mask=None):
         raw = transformer(
             hidden_states=z_in.to(dtype),
             timestep=t_in,
             encoder_hidden_states=text_emb,
+            encoder_hidden_states_mask=text_mask,
             vector_cond=vec_cond,
             height=height_t,
             width=width_t,
@@ -630,11 +667,19 @@ def generate(
     for i, t in enumerate(timesteps):
         t_input = t.expand(1)
 
-        pred_cond = _model_forward(z, t_input, prompt_embeds, vector_cond)
+        # Determine per-step guidance scale from schedule or constant
+        gs_i = guidance_schedule[i] if guidance_schedule is not None else guidance_scale
 
-        if do_cfg:
-            pred_uncond = _model_forward(z, t_input, negative_prompt_embeds, negative_vector_cond)
-            v_pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
+        # Match reference RFLOW logic:
+        #   use_uncond = (not skip_uncond) or (guidance_scale_ > 1.0)
+        # When skip_uncond=True and scale is 1.0, skip the unconditional pass entirely.
+        use_uncond = has_neg and ((not skip_uncond) or (gs_i > 1.0))
+
+        pred_cond = _model_forward(z, t_input, prompt_embeds, vector_cond, prompt_embeds_mask)
+
+        if use_uncond:
+            pred_uncond = _model_forward(z, t_input, negative_prompt_embeds, negative_vector_cond, negative_prompt_embeds_mask)
+            v_pred = pred_uncond + gs_i * (pred_cond - pred_uncond)
         else:
             v_pred = pred_cond
 
@@ -716,6 +761,11 @@ def main():
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     generator = torch.Generator(device="cpu").manual_seed(args.seed)
 
+    # Resolve skip_uncond early so the banner shows the actual value
+    skip_uncond = args.skip_uncond
+    if skip_uncond is None:
+        skip_uncond = "distilled" in args.transformer_weights.lower()
+
     if rank == 0:
         print(f"\n{'=' * 60}")
         print("Marey MMDiT Video Generation")
@@ -725,6 +775,9 @@ def main():
         print(f"  Prompt:     {args.prompt}")
         print(f"  Resolution: {args.width}x{args.height}, {args.num_frames} frames")
         print(f"  Steps:      {args.steps}, CFG: {args.guidance_scale}")
+        print(f"  Schedule:   use_guidance_schedule={args.use_guidance_schedule}, "
+              f"skip_uncond={skip_uncond}, clip_value={args.clip_value}")
+        print(f"  Flow shift: {args.flow_shift}")
         print(f"  Dtype:      {args.dtype}")
         print(f"  TP:         {args.tp}")
         print(f"  Diag:       {args.diag}")
@@ -746,33 +799,41 @@ def main():
         print(f"Text encoders loaded in {t_enc_load:.1f}s")
 
         t0 = time.perf_counter()
-        prompt_embeds, vector_cond = encode_text(args.prompt, encoders, device, dtype)
+        prompt_embeds, prompt_masks, vector_cond = encode_text(args.prompt, encoders, device, dtype)
         t_encode = time.perf_counter() - t0
         seq_shapes = [s.shape for s in prompt_embeds] if isinstance(prompt_embeds, list) else prompt_embeds.shape
         print(f"Prompt encoded in {t_encode:.1f}s  seq={seq_shapes}  vec={vector_cond.shape}")
 
         negative_prompt_embeds = None
+        negative_prompt_masks = None
         negative_vector_cond = None
         if use_cfg:
-            negative_prompt_embeds, negative_vector_cond = encode_text(negative_prompt_text, encoders, device, dtype)
+            negative_prompt_embeds, negative_prompt_masks, negative_vector_cond = encode_text(negative_prompt_text, encoders, device, dtype)
             print(f"Negative prompt encoded  (CFG scale={args.guidance_scale})")
 
         del encoders
         torch.cuda.empty_cache()
     else:
         prompt_embeds = None
+        prompt_masks = None
         vector_cond = None
         negative_prompt_embeds = None
+        negative_prompt_masks = None
         negative_vector_cond = None
 
     if world_size > 1:
-        obj_list = [prompt_embeds, vector_cond, negative_prompt_embeds, negative_vector_cond]
+        obj_list = [prompt_embeds, prompt_masks, vector_cond, negative_prompt_embeds, negative_prompt_masks, negative_vector_cond]
         torch.distributed.broadcast_object_list(obj_list, src=0)
-        prompt_embeds, vector_cond, negative_prompt_embeds, negative_vector_cond = obj_list
+        prompt_embeds, prompt_masks, vector_cond, negative_prompt_embeds, negative_prompt_masks, negative_vector_cond = obj_list
         if isinstance(prompt_embeds, list):
             prompt_embeds = [p.to(device) for p in prompt_embeds]
         else:
             prompt_embeds = prompt_embeds.to(device)
+        if prompt_masks is not None:
+            if isinstance(prompt_masks, list):
+                prompt_masks = [m.to(device) for m in prompt_masks]
+            else:
+                prompt_masks = prompt_masks.to(device)
         if vector_cond is not None:
             vector_cond = vector_cond.to(device)
         if negative_prompt_embeds is not None:
@@ -780,6 +841,11 @@ def main():
                 negative_prompt_embeds = [n.to(device) for n in negative_prompt_embeds]
             else:
                 negative_prompt_embeds = negative_prompt_embeds.to(device)
+        if negative_prompt_masks is not None:
+            if isinstance(negative_prompt_masks, list):
+                negative_prompt_masks = [m.to(device) for m in negative_prompt_masks]
+            else:
+                negative_prompt_masks = negative_prompt_masks.to(device)
         if negative_vector_cond is not None:
             negative_vector_cond = negative_vector_cond.to(device)
 
@@ -836,6 +902,24 @@ def main():
     if rank == 0:
         print(f"Using VAE downsample factors: {vae_ds}")
 
+    # Build guidance schedule (matches reference RFLOW warmup/cooldown oscillation)
+    guidance_sched: list[float] | None = None
+    if args.use_guidance_schedule and use_cfg:
+        guidance_sched = build_guidance_schedule(
+            num_steps=args.steps,
+            guidance_scale=args.guidance_scale,
+            warmup_frac=args.warmup_frac,
+            cooldown_frac=args.cooldown_frac,
+            guidance_every_n_steps=args.guidance_every_n_steps,
+        )
+        if rank == 0:
+            active = sum(1 for g in guidance_sched if g > 1.0)
+            print(f"Guidance schedule: {active}/{len(guidance_sched)} steps active "
+                  f"(warmup={args.warmup_frac}, cooldown={args.cooldown_frac}, "
+                  f"every_n={args.guidance_every_n_steps})")
+
+    clip_val = args.clip_value if args.clip_value > 0 else None
+
     # Generate (all ranks participate in TP forward passes)
     t0 = time.perf_counter()
     latents = generate(
@@ -850,11 +934,16 @@ def main():
         guidance_scale=args.guidance_scale,
         negative_prompt_embeds=negative_prompt_embeds,
         negative_vector_cond=negative_vector_cond,
+        prompt_embeds_mask=prompt_masks,
+        negative_prompt_embeds_mask=negative_prompt_masks,
         device=device,
         dtype=dtype,
         generator=generator,
         vae_downsample_factors=vae_ds,
+        clip_value=clip_val,
         extra_features=extra_features,
+        guidance_schedule=guidance_sched,
+        skip_uncond=skip_uncond,
     )
     t_gen = time.perf_counter() - t0
     if rank == 0:

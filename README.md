@@ -12,25 +12,39 @@ uv pip install vllm==0.17.0 --torch-backend=auto
 uv pip install -e ../moonvalley_ai/open_sora --no-deps
 ```
 
-## Usage
+## Text to Video Usage with vllm-omni
 
 ```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python examples/offline_inference/marey/text_to_video.py \
-  --prompt "cat playing guitar" \
-  --output output_$(date +%Y%m%d_%H%M%S).mp4 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+uv run --project /home/david/repos/vllm-omni \
+python /home/david/repos/vllm-omni/examples/offline_inference/marey/text_to_video.py \
+  --prompt "a cat with a blacktop hat walking on the moon in a cartoon art style" \
+  --output /home/david/repos/vllm-omni/vllm_omni_output_$(date +%Y%m%d_%H%M%S).mp4 \
   --height 1080 \
   --width 1920 \
   --num-frames 17
 ```
 
-Faster command:
+## Marey Inference Usage
+
 ```bash
-source .venv/bin/activate && PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  torchrun --nproc_per_node=8 examples/offline_inference/marey/text_to_video.py \
-  --tp 8 \
-  --steps 10 \
+PYTHONPATH=/home/david/repos/moonvalley_ai \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+uv run --project /home/david/repos/moonvalley_ai/inference-service \
+torchrun --nproc_per_node=8 /home/david/repos/moonvalley_ai/inference-service/marey_inference.py infer \
+  --num-seq-parallel-splits 8 \
+  --offload-diffusion \
+  --offload-vae \
+  --offload-text-encoder \
+  --model-folder "/app/wlam/models/checkpoints/marey/distilled-0001" \
+  --checkpoint-folder "/app/wlam/models/checkpoints/marey/distilled-0001/epoch0-global_step7000_distilled" \
+  --watermarker-path "/app/wlam/models/checkpoints/marey/videoseal/y_256b_img.jit" \
+  --height 1080 \
+  --width 1920 \
   --num-frames 17 \
-  --height 360 --width 640 \
-  --no-cfg \
-  --prompt "cat playing guitar"
+  --steps 100 \
+  --guidance-scale 7.5 \
+  --seed 42 \
+  --output /home/david/repos/vllm-omni/marey_inference_output_$(date +%Y%m%d_%H%M%S).mp4 \
+  "a cat with a blacktop hat walking on the moon in a cartoon art style"
 ```
