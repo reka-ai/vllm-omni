@@ -43,7 +43,7 @@ import yaml
 DEFAULT_CONFIG = "/app/wlam/models/checkpoints/marey/distilled-0001/config.yaml"
 DEFAULT_TRANSFORMER_WEIGHTS = (
     "/app/wlam/models/checkpoints/marey/distilled-0001/"
-    "epoch0-global_step7000_distilled/ema_inference_ckpt.safetensors"
+    "epoch0-global_step5000_distilled/ema_inference_ckpt.safetensors"
 )
 DEFAULT_VAE_WEIGHTS = "/app/wlam/models/checkpoints/marey/vae/epoch_4_step2819000.ckpt"
 
@@ -81,8 +81,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-uncond", action=argparse.BooleanOptionalAction, default=None,
                         help="Skip unconditional prediction when guidance scale is 1.0. "
                              "Default: auto-detect from checkpoint path (True for distilled models).")
-    parser.add_argument("--warmup-frac", type=float, default=0.24, help="Fraction of steps for guidance warmup.")
-    parser.add_argument("--cooldown-frac", type=float, default=0.36, help="Fraction of steps for guidance cooldown.")
+    parser.add_argument("--warmup-steps", type=int, default=4, help="Number of guidance warmup steps.")
+    parser.add_argument("--cooldown-steps", type=int, default=18, help="Number of guidance cooldown steps.")
     parser.add_argument("--guidance-every-n-steps", type=int, default=2,
                         help="Apply guidance every N steps during the middle phase.")
     parser.add_argument("--clip-value", type=float, default=10.0, help="Clamp predicted x0 to [-clip, clip]. 0 to disable.")
@@ -564,8 +564,8 @@ def create_flow_timesteps(
 def build_guidance_schedule(
     num_steps: int,
     guidance_scale: float,
-    warmup_frac: float = 0.24,
-    cooldown_frac: float = 0.36,
+    warmup_steps: int = 4,
+    cooldown_steps: int = 18,
     guidance_every_n_steps: int = 2,
 ) -> list[float]:
     """Build an oscillating guidance schedule matching the reference RFLOW scheduler.
@@ -574,8 +574,6 @@ def build_guidance_schedule(
     During middle: CFG oscillates (active every ``guidance_every_n_steps``).
     During cooldown: CFG is off (scale=1.0).
     """
-    warmup_steps = int(num_steps * warmup_frac)
-    cooldown_steps = int(num_steps * cooldown_frac)
     cooldown_start = num_steps - cooldown_steps
 
     schedule = []
@@ -584,10 +582,12 @@ def build_guidance_schedule(
             schedule.append(guidance_scale)
         elif i >= cooldown_start:
             schedule.append(1.0)
-        elif i % guidance_every_n_steps == 0:
-            schedule.append(guidance_scale)
         else:
-            schedule.append(1.0)
+            middle_idx = i - warmup_steps
+            if middle_idx > 0 and middle_idx % guidance_every_n_steps == 0:
+                schedule.append(guidance_scale)
+            else:
+                schedule.append(1.0)
     return schedule
 
 
@@ -627,10 +627,8 @@ def generate(
     vae_scale_factor_spatial = vae_downsample_factors[1]
     num_train_timesteps = 1000
 
-    if num_frames % vae_scale_factor_temporal != 1:
-        num_frames = num_frames // vae_scale_factor_temporal * vae_scale_factor_temporal + 1
-    num_frames = max(num_frames, 1)
-    num_latent_frames = (num_frames - 1) // vae_scale_factor_temporal + 1
+    time_pad = 0 if (num_frames % vae_scale_factor_temporal == 0) else (vae_scale_factor_temporal - num_frames % vae_scale_factor_temporal)
+    num_latent_frames = (num_frames + time_pad) // vae_scale_factor_temporal
 
     latent_h = math.ceil(height / vae_scale_factor_spatial)
     latent_w = math.ceil(width / vae_scale_factor_spatial)
@@ -935,14 +933,14 @@ def main():
         guidance_sched = build_guidance_schedule(
             num_steps=args.steps,
             guidance_scale=args.guidance_scale,
-            warmup_frac=args.warmup_frac,
-            cooldown_frac=args.cooldown_frac,
+            warmup_steps=args.warmup_steps,
+            cooldown_steps=args.cooldown_steps,
             guidance_every_n_steps=args.guidance_every_n_steps,
         )
         if rank == 0:
             active = sum(1 for g in guidance_sched if g > 1.0)
             print(f"Guidance schedule: {active}/{len(guidance_sched)} steps active "
-                  f"(warmup={args.warmup_frac}, cooldown={args.cooldown_frac}, "
+                  f"(warmup_steps={args.warmup_steps}, cooldown_steps={args.cooldown_steps}, "
                   f"every_n={args.guidance_every_n_steps})")
 
     clip_val = args.clip_value if args.clip_value > 0 else None
