@@ -226,11 +226,16 @@ def encode_text(
     encoders: dict,
     device: torch.device,
     dtype: torch.dtype,
+    quote_override: str | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor | None]:
     """Encode text using UL2 (sequence), CLIP (vector), and ByT5 (quotes).
 
     Returns (seq_cond, seq_cond_masks, vector_cond) where seq_cond_masks
     are boolean attention masks aligned with the sequence embeddings.
+
+    *quote_override*: if provided, ByT5 encodes this text instead of
+    extracting quotes from *prompt*.  The reference scheduler reuses the
+    positive prompt's quote text for the negative (unconditional) encoding.
     """
     # UL2 encoding (sequence tokens)
     ul2_tokenizer = encoders["ul2_tokenizer"]
@@ -276,7 +281,7 @@ def encode_text(
     byt5_model = encoders["byt5_model"]
     byt5_max_len = encoders["byt5_max_length"]
 
-    quote_text = _extract_quotes(prompt)
+    quote_text = quote_override if quote_override is not None else _extract_quotes(prompt)
     byt5_inputs = byt5_tokenizer(
         quote_text,
         padding="max_length",
@@ -822,7 +827,10 @@ def main():
         negative_prompt_masks = None
         negative_vector_cond = None
         if use_cfg:
-            negative_prompt_embeds, negative_prompt_masks, negative_vector_cond = encode_text(negative_prompt_text, encoders, device, dtype)
+            positive_quote_text = _extract_quotes(args.prompt)
+            negative_prompt_embeds, negative_prompt_masks, negative_vector_cond = encode_text(
+                negative_prompt_text, encoders, device, dtype, quote_override=positive_quote_text,
+            )
             print(f"Negative prompt encoded  (CFG scale={args.guidance_scale})")
 
         del encoders
