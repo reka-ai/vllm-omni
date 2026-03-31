@@ -186,15 +186,15 @@ def load_text_encoders(config: dict, device: torch.device, dtype: torch.dtype):
     clip_max_len = te_cfg.get("clip_max_length", 77)
     byt5_max_len = te_cfg.get("byt5_max_length", 70)
 
-    from transformers import AutoModel, AutoTokenizer, CLIPModel, CLIPProcessor, T5EncoderModel
+    from transformers import AutoModel, AutoTokenizer, CLIPTextModel, CLIPTokenizer, T5EncoderModel
 
     print(f"Loading UL2 text encoder: {ul2_name}")
     ul2_tokenizer = AutoTokenizer.from_pretrained(ul2_name)
     ul2_model = AutoModel.from_pretrained(ul2_name, torch_dtype=dtype).encoder.to(device).eval()
 
     print(f"Loading CLIP text encoder: {clip_name}")
-    clip_model = CLIPModel.from_pretrained(clip_name, torch_dtype=dtype).to(device).eval()
-    clip_processor = CLIPProcessor.from_pretrained(clip_name)
+    clip_model = CLIPTextModel.from_pretrained(clip_name, torch_dtype=dtype).to(device).eval()
+    clip_tokenizer = CLIPTokenizer.from_pretrained(clip_name)
 
     print(f"Loading ByT5 text encoder: {byt5_name}")
     byt5_tokenizer = AutoTokenizer.from_pretrained(byt5_name)
@@ -205,7 +205,7 @@ def load_text_encoders(config: dict, device: torch.device, dtype: torch.dtype):
         "ul2_model": ul2_model,
         "ul2_max_length": ul2_max_len,
         "clip_model": clip_model,
-        "clip_processor": clip_processor,
+        "clip_tokenizer": clip_tokenizer,
         "clip_max_length": clip_max_len,
         "byt5_tokenizer": byt5_tokenizer,
         "byt5_model": byt5_model,
@@ -258,23 +258,22 @@ def encode_text(
         )
         ul2_seq = ul2_output.last_hidden_state.to(dtype)  # [1, 300, 4096]
 
-    # CLIP encoding (pooled vector)
+    # CLIP encoding (pooled vector — must use CLIPTextModel.pooler_output,
+    # NOT CLIPModel.get_text_features() which applies an extra text_projection)
     clip_model = encoders["clip_model"]
-    clip_processor = encoders["clip_processor"]
+    clip_tokenizer = encoders["clip_tokenizer"]
     clip_max_len = encoders["clip_max_length"]
 
-    clip_inputs = clip_processor(
-        text=[prompt],
+    clip_inputs = clip_tokenizer(
+        [prompt],
         padding="max_length",
         max_length=clip_max_len,
         truncation=True,
         return_tensors="pt",
     )
     with torch.no_grad():
-        clip_output = clip_model.get_text_features(**{k: v.to(device) for k, v in clip_inputs.items()})
-        if not isinstance(clip_output, torch.Tensor):
-            clip_output = clip_output.pooler_output
-        vector_cond = clip_output.to(dtype)  # [1, clip_dim]
+        clip_output = clip_model(input_ids=clip_inputs["input_ids"].to(device))
+        vector_cond = clip_output.pooler_output.to(dtype)  # [1, clip_dim]
 
     # ByT5 encoding (quote / full prompt)
     byt5_tokenizer = encoders["byt5_tokenizer"]
@@ -550,15 +549,22 @@ def create_flow_timesteps(
 
     Produces the teacher's schedule sub-sampled to *num_steps* entries.
     Optionally applies timestep shift (only when use_timestep_transform=True in config).
+
+    Matches the reference RFLOW.draw_time + RFlowScheduler.timestep_shift
+    computation order exactly (float64 intermediate via .tolist()) to avoid
+    floating-point divergence in the DDPM denoising loop.
     """
-    sigmas = torch.linspace(tmax, tmin, teacher_steps)
+    nt = num_train_timesteps
+    sigmas_f64 = torch.linspace(tmax, tmin, teacher_steps).tolist()
+    timesteps_all = [torch.tensor([t * nt], device=device) for t in sigmas_f64]
+
     if shift is not None and shift > 0:
-        sigmas = shift * sigmas / (1.0 + (shift - 1.0) * sigmas)
-    timesteps_all = sigmas * num_train_timesteps
+        for i, t in enumerate(timesteps_all):
+            t_norm = t / nt
+            timesteps_all[i] = (shift * t_norm / (1.0 + (shift - 1.0) * t_norm)) * nt
 
     stride = max(1, teacher_steps // num_steps)
-    timesteps = [timesteps_all[i * stride].unsqueeze(0).to(device) for i in range(num_steps)]
-    return timesteps
+    return [timesteps_all[i * stride] for i in range(num_steps)]
 
 
 # ---------------------------------------------------------------------------
@@ -589,7 +595,7 @@ def build_guidance_schedule(
             schedule.append(1.0)
         else:
             middle_idx = i - warmup_steps
-            if middle_idx > 0 and middle_idx % guidance_every_n_steps == 0:
+            if middle_idx > 0 and (middle_idx - 1) % guidance_every_n_steps == 0:
                 schedule.append(guidance_scale)
             else:
                 schedule.append(1.0)
@@ -818,7 +824,11 @@ def main():
         print(f"Text encoders loaded in {t_enc_load:.1f}s")
 
         t0 = time.perf_counter()
-        prompt_embeds, prompt_masks, vector_cond = encode_text(args.prompt, encoders, device, dtype)
+        # Reference passes quote_prompts="" to the scheduler (the line is commented
+        # out in marey_inference.py), so ByT5 encodes an empty string.
+        prompt_embeds, prompt_masks, vector_cond = encode_text(
+            args.prompt, encoders, device, dtype, quote_override="",
+        )
         t_encode = time.perf_counter() - t0
         seq_shapes = [s.shape for s in prompt_embeds] if isinstance(prompt_embeds, list) else prompt_embeds.shape
         print(f"Prompt encoded in {t_encode:.1f}s  seq={seq_shapes}  vec={vector_cond.shape}")
@@ -827,9 +837,8 @@ def main():
         negative_prompt_masks = None
         negative_vector_cond = None
         if use_cfg:
-            positive_quote_text = _extract_quotes(args.prompt)
             negative_prompt_embeds, negative_prompt_masks, negative_vector_cond = encode_text(
-                negative_prompt_text, encoders, device, dtype, quote_override=positive_quote_text,
+                negative_prompt_text, encoders, device, dtype, quote_override="",
             )
             print(f"Negative prompt encoded  (CFG scale={args.guidance_scale})")
 
@@ -953,6 +962,14 @@ def main():
 
     clip_val = args.clip_value if args.clip_value > 0 else None
 
+    # Re-seed immediately before generation so the first torch.randn_like
+    # call (initial noise) matches the reference, where models are loaded in
+    # the constructor and _set_seed(42) is called at the start of each infer()
+    # with no RNG-consuming operations before noise generation.
+    _random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
     # Generate (all ranks participate in TP forward passes)
     t0 = time.perf_counter()
     latents = generate(
@@ -994,6 +1011,10 @@ def main():
               f"min={lf.min().item():.4f} max={lf.max().item():.4f}")
         for ch in range(min(latents.shape[1], 4)):
             print(f"  ch{ch}: mean={lf[0,ch].mean().item():.4f} std={lf[0,ch].std().item():.4f}")
+
+        latent_path = str(Path(args.output).with_suffix(".latents.pt"))
+        torch.save(latents.float().cpu(), latent_path)
+        print(f"Saved latents to {latent_path}")
 
         vae = load_vae(vae_cfg, device, dtype)
         if vae is not None:

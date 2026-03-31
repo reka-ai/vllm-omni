@@ -1109,8 +1109,12 @@ class MareyTransformer(nn.Module):
         # Temporal positions for RoPE
         temporal_pos = get_temporal_pos(x, T, S)
 
-        # Rearrange text for attention
-        y = seq_cond
+        # Zero out padding text tokens so they don't pollute joint attention
+        # (reference: Flux.rearrange_tokens_for_attention applies y * mask)
+        if seq_cond_mask is not None:
+            y = seq_cond * seq_cond_mask.unsqueeze(-1)
+        else:
+            y = seq_cond
         y_t_emb = t_mlp
 
         # Transformer blocks
