@@ -48,6 +48,18 @@ DEFAULT_TRANSFORMER_WEIGHTS = (
 DEFAULT_VAE_WEIGHTS = "/app/wlam/models/checkpoints/marey/vae/epoch_4_step2819000.ckpt"
 
 
+def _dump(dump_dir, filename, data):
+    """Save a tensor or python object to dump_dir/filename. No-op when dump_dir is None."""
+    if dump_dir is None:
+        return
+    path = os.path.join(dump_dir, filename)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if isinstance(data, torch.Tensor):
+        torch.save(data.detach().cpu(), path)
+    else:
+        torch.save(data, path)
+
+
 DEFAULT_NEGATIVE_PROMPT = (
     "<synthetic> <scene cut> gopro, bright, contrast, static, overexposed, bright, "
     "vignette, artifacts, still, noise, texture, scanlines, videogame, 360 camera, "
@@ -94,6 +106,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"], help="Compute dtype.")
     parser.add_argument("--tp", type=int, default=1, help="Tensor parallel size. Use torchrun --nproc_per_node=N for tp > 1.")
     parser.add_argument("--diag", action="store_true", help="Enable DIAG / BLOCK_DIAG diagnostic output from the transformer.")
+    parser.add_argument("--dump-dir", type=str, default=None,
+                        help="Directory to dump intermediate diffusion tensors for debugging.")
+    parser.add_argument("--load-initial-noise", type=str, default=None,
+                        help="Path to a .pt file containing initial noise z to use instead of random. "
+                             "Use this to match the ground truth implementation's noise exactly.")
+    parser.add_argument("--load-step-noise-dir", type=str, default=None,
+                        help="Path to a ground-truth dump dir. Per-step DDPM noise will be "
+                             "loaded from <dir>/step_NNN/ddpm_noise.pt instead of sampled randomly.")
     return parser.parse_args()
 
 
@@ -190,7 +210,8 @@ def load_text_encoders(config: dict, device: torch.device, dtype: torch.dtype):
 
     print(f"Loading UL2 text encoder: {ul2_name}")
     ul2_tokenizer = AutoTokenizer.from_pretrained(ul2_name)
-    ul2_model = AutoModel.from_pretrained(ul2_name, torch_dtype=dtype).encoder.to(device).eval()
+    # ul2_model = AutoModel.from_pretrained(ul2_name, torch_dtype=dtype).encoder.to(device).eval()
+    ul2_model = T5EncoderModel.from_pretrained(ul2_name, torch_dtype=dtype).to(device).eval()
 
     print(f"Loading CLIP text encoder: {clip_name}")
     clip_model = CLIPTextModel.from_pretrained(clip_name, torch_dtype=dtype).to(device).eval()
@@ -319,8 +340,9 @@ def _setup_opensora_imports():
     """
     import types
 
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = Path(__file__).resolve().parents[4]
     moonvalley_dir = str(repo_root / "moonvalley_ai")
+    print(f'Resolved moonvalley_dir: {moonvalley_dir}')
     if moonvalley_dir not in sys.path:
         sys.path.insert(0, moonvalley_dir)
 
@@ -626,6 +648,9 @@ def generate(
     uncond_extra_features: dict[str, torch.Tensor] | None = None,
     guidance_schedule: list[float] | None = None,
     skip_uncond: bool = False,
+    dump_dir: str | None = None,
+    load_initial_noise: str | None = None,
+    load_step_noise_dir: str | None = None,
 ) -> torch.Tensor:
     """Run the DDPM flow-matching denoising loop and return latents.
 
@@ -646,9 +671,57 @@ def generate(
     in_channels = transformer.in_channels
     shape = (1, in_channels, num_latent_frames, latent_h, latent_w)
 
-    z_zeros = torch.zeros(shape, device=device, dtype=dtype)
-    z = torch.randn_like(z_zeros)
-    del z_zeros
+    if load_initial_noise is not None:
+        print(f"Loading initial noise from {load_initial_noise}")
+        z = torch.load(load_initial_noise, map_location=device, weights_only=True).to(dtype)
+        assert z.shape == shape, f"Loaded noise shape {z.shape} != expected {shape}"
+    else:
+        z_zeros = torch.zeros(shape, device=device, dtype=dtype)
+        z = torch.randn_like(z_zeros)
+        del z_zeros
+
+    # -- dump timesteps, hparams, initial noise, text embeddings --
+    _dump(dump_dir, "timesteps.pt", torch.stack(timesteps))
+    _dump(dump_dir, "hparams.pt", {
+        "guidance_scale": guidance_scale,
+        "clip_value": clip_value,
+        "skip_uncond": skip_uncond,
+        "num_steps": num_steps,
+        "num_train_timesteps": num_train_timesteps,
+        "sampler": "ddpm",
+        "load_initial_noise": load_initial_noise,
+    })
+    _dump(dump_dir, "z_initial_noise.pt", z)
+    if guidance_schedule is not None:
+        _dump(dump_dir, "guidance_schedule.pt", guidance_schedule)
+
+    # Dump text conditioning
+    if isinstance(prompt_embeds, list):
+        for idx, pe in enumerate(prompt_embeds):
+            _dump(dump_dir, f"text_cond_seq_{idx}.pt", pe)
+    else:
+        _dump(dump_dir, "text_cond_seq.pt", prompt_embeds)
+    if isinstance(prompt_embeds_mask, list):
+        for idx, pm in enumerate(prompt_embeds_mask):
+            _dump(dump_dir, f"text_cond_mask_{idx}.pt", pm)
+    elif prompt_embeds_mask is not None:
+        _dump(dump_dir, "text_cond_mask.pt", prompt_embeds_mask)
+    if vector_cond is not None:
+        _dump(dump_dir, "vector_cond.pt", vector_cond)
+    if negative_prompt_embeds is not None:
+        if isinstance(negative_prompt_embeds, list):
+            for idx, ne in enumerate(negative_prompt_embeds):
+                _dump(dump_dir, f"null_cond_seq_{idx}.pt", ne)
+        else:
+            _dump(dump_dir, "null_cond_seq.pt", negative_prompt_embeds)
+    if negative_prompt_embeds_mask is not None:
+        if isinstance(negative_prompt_embeds_mask, list):
+            for idx, nm in enumerate(negative_prompt_embeds_mask):
+                _dump(dump_dir, f"null_cond_mask_{idx}.pt", nm)
+        else:
+            _dump(dump_dir, "null_cond_mask.pt", negative_prompt_embeds_mask)
+    if negative_vector_cond is not None:
+        _dump(dump_dir, "null_vector_cond.pt", negative_vector_cond)
 
     height_t = torch.tensor([height], device=device, dtype=dtype)
     width_t = torch.tensor([width], device=device, dtype=dtype)
@@ -685,6 +758,10 @@ def generate(
         return raw
 
     for i, t in enumerate(timesteps):
+        _step = f"step_{i:03d}"
+        _dump(dump_dir, f"{_step}/z_input.pt", z)
+        _dump(dump_dir, f"{_step}/t.pt", t)
+
         t_input = t.expand(1)
 
         # Determine per-step guidance scale from schedule or constant
@@ -695,13 +772,23 @@ def generate(
         # When skip_uncond=True and scale is 1.0, skip the unconditional pass entirely.
         use_uncond = has_neg and ((not skip_uncond) or (gs_i > 1.0))
 
+        _dump(dump_dir, f"{_step}/guidance_metadata.pt", {
+            "guidance_scale_effective": float(gs_i),
+            "use_uncond": use_uncond,
+            "skip_uncond": skip_uncond,
+        })
+
         pred_cond = _model_forward(z, t_input, prompt_embeds, vector_cond, prompt_embeds_mask, ef=extra_features)
+        _dump(dump_dir, f"{_step}/pred_cond.pt", pred_cond)
 
         if use_uncond:
             pred_uncond = _model_forward(z, t_input, negative_prompt_embeds, negative_vector_cond, negative_prompt_embeds_mask, ef=_uncond_ef)
+            _dump(dump_dir, f"{_step}/pred_uncond.pt", pred_uncond)
             v_pred = pred_uncond + gs_i * (pred_cond - pred_uncond)
         else:
             v_pred = pred_cond
+
+        _dump(dump_dir, f"{_step}/v_pred_combined.pt", v_pred)
 
         # DDPM flow-matching step (matches RFLOW reference sampler: ddpm)
         sigma_t = (t / num_train_timesteps).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
@@ -722,10 +809,21 @@ def generate(
             mean = alpha_ts * sigma_s_div_t_sq * z + alpha_s * sigma_ts_div_t_sq * x0
             variance = sigma_ts_div_t_sq * sigma_s ** 2
 
-            noise = torch.randn_like(z)
+            if load_step_noise_dir is not None:
+                print(f'Loading step {i} noise from {load_step_noise_dir}')
+                noise = torch.load(
+                    os.path.join(load_step_noise_dir, f"step_{i:03d}", "ddpm_noise.pt"),
+                    map_location=device, weights_only=True,
+                ).to(dtype)
+            else:
+                noise = torch.randn_like(z)
+            _dump(dump_dir, f"{_step}/ddpm_noise.pt", noise)
             z = mean + torch.sqrt(variance) * noise
         else:
             z = x0
+
+        _dump(dump_dir, f"{_step}/x0_pred.pt", x0)
+        _dump(dump_dir, f"{_step}/z_updated.pt", z)
 
         if is_main and ((i + 1) % 5 == 0 or i == 0 or i == len(timesteps) - 1):
             zf = z.float()
@@ -791,6 +889,7 @@ def main():
     if skip_uncond is None:
         skip_uncond = "distilled" in args.transformer_weights.lower()
 
+
     if rank == 0:
         print(f"\n{'=' * 60}")
         print("Marey MMDiT Video Generation")
@@ -817,6 +916,11 @@ def main():
 
     t_enc_load = 0.0
     t_encode = 0.0
+
+    if rank == 0:
+        print(f'Pre-loading VAE')
+        vae_cfg = config.get("vae", {})
+        vae = load_vae(vae_cfg, device, dtype)
     if rank == 0:
         t0 = time.perf_counter()
         encoders = load_text_encoders(config, device, dtype)
@@ -995,6 +1099,9 @@ def main():
         uncond_extra_features=uncond_extra_features,
         guidance_schedule=guidance_sched,
         skip_uncond=skip_uncond,
+        dump_dir=args.dump_dir,
+        load_initial_noise=args.load_initial_noise,
+        load_step_noise_dir=args.load_step_noise_dir,
     )
     t_gen = time.perf_counter() - t0
     if rank == 0:
