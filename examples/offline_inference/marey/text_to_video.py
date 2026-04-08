@@ -248,6 +248,8 @@ def encode_text(
     device: torch.device,
     dtype: torch.dtype,
     quote_override: str | None = None,
+    dump_dir: str | None = None,
+    dump_prefix: str = "text_cond",
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor | None]:
     """Encode text using UL2 (sequence), CLIP (vector), and ByT5 (quotes).
 
@@ -272,6 +274,8 @@ def encode_text(
         return_tensors="pt",
     )
     ul2_mask = inputs["attention_mask"].to(device, torch.bool)
+    _dump(dump_dir, f"{dump_prefix}_ul2_input_ids.pt", inputs.input_ids)
+    _dump(dump_dir, f"{dump_prefix}_ul2_attention_mask.pt", inputs.attention_mask)
     with torch.no_grad():
         ul2_output = ul2_model(
             input_ids=inputs.input_ids.to(device),
@@ -320,6 +324,7 @@ def encode_text(
 
     seq_cond = [ul2_seq, byt5_seq]
     seq_cond_masks = [ul2_mask, byt5_mask]
+    print(f'VECTOR COND: {vector_cond.shape}')
     return seq_cond, seq_cond_masks, vector_cond
 
 
@@ -932,6 +937,7 @@ def main():
         # out in marey_inference.py), so ByT5 encodes an empty string.
         prompt_embeds, prompt_masks, vector_cond = encode_text(
             args.prompt, encoders, device, dtype, quote_override="",
+            dump_dir=args.dump_dir, dump_prefix="ul2_positive",
         )
         t_encode = time.perf_counter() - t0
         seq_shapes = [s.shape for s in prompt_embeds] if isinstance(prompt_embeds, list) else prompt_embeds.shape
@@ -943,6 +949,7 @@ def main():
         if use_cfg:
             negative_prompt_embeds, negative_prompt_masks, negative_vector_cond = encode_text(
                 negative_prompt_text, encoders, device, dtype, quote_override="",
+                dump_dir=args.dump_dir, dump_prefix="ul2_negative",
             )
             print(f"Negative prompt encoded  (CFG scale={args.guidance_scale})")
 
