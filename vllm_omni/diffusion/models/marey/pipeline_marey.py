@@ -429,16 +429,16 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         self.byt5_max_length = te_cfg.get("byt5_max_length", 70)
 
         self.ul2_tokenizer = AutoTokenizer.from_pretrained(ul2_name)
-        self.ul2_model = T5EncoderModel.from_pretrained(ul2_name, torch_dtype=dtype).to(self.device).eval()
+        self.ul2_model = T5EncoderModel.from_pretrained(ul2_name, torch_dtype=dtype).eval().to("cpu")
 
         self.clip_tokenizer = CLIPTokenizer.from_pretrained(clip_name)
-        self.clip_model = CLIPTextModel.from_pretrained(clip_name, torch_dtype=dtype).to(self.device).eval()
+        self.clip_model = CLIPTextModel.from_pretrained(clip_name, torch_dtype=dtype).eval().to("cpu")
 
         self.byt5_tokenizer = AutoTokenizer.from_pretrained(byt5_name)
-        self.byt5_model = T5EncoderModel.from_pretrained(byt5_name, torch_dtype=dtype).to(self.device).eval()
+        self.byt5_model = T5EncoderModel.from_pretrained(byt5_name, torch_dtype=dtype).eval().to("cpu")
 
         # -- VAE --------------------------------------------------------------
-        self.vae = _load_vae(vae_cfg, self.device, dtype)
+        self.vae = _load_vae(vae_cfg, "cpu", dtype)
         self.vae_downsample_factors = tuple(vae_cfg.get("downsample_factors", (4, 16, 16)))
         self.vae_scale_factor_temporal = self.vae_downsample_factors[0]
         self.vae_scale_factor_spatial = self.vae_downsample_factors[1]
@@ -612,7 +612,13 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         height = (height // mod_value) * mod_value
         width = (width // mod_value) * mod_value
 
-        # -- Text encoding ----------------------------------------------------
+        # -- Text encoding (offload transformer, load encoders) ---------------
+        self.transformer.to("cpu")
+        torch.cuda.empty_cache()
+        self.ul2_model.to(device)
+        self.clip_model.to(device)
+        self.byt5_model.to(device)
+
         # Reference passes quote_override="" (ByT5 encodes empty string)
         prompt_embeds, prompt_masks, vector_cond = self.encode_prompt(
             prompt, device, dtype, quote_override="",
@@ -627,6 +633,13 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
             negative_prompt_embeds, negative_prompt_masks, negative_vector_cond = self.encode_prompt(
                 neg_text, device, dtype, quote_override="",
             )
+
+        # Offload encoders, reload transformer
+        self.ul2_model.to("cpu")
+        self.clip_model.to("cpu")
+        self.byt5_model.to("cpu")
+        torch.cuda.empty_cache()
+        self.transformer.to(device)
 
         # -- Timesteps --------------------------------------------------------
         timesteps = _create_flow_timesteps(
@@ -749,6 +762,9 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         self._current_timestep = None
 
         # -- VAE decode -------------------------------------------------------
+        self.transformer.to("cpu")
+        self.vae.to(device)
+        torch.cuda.empty_cache()
         output_type = sp.output_type or "np"
         if output_type == "latent" or self.vae is None:
             output = z
@@ -770,6 +786,9 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                 )
             if isinstance(output, tuple):
                 output = output[0]
+        self.vae.to("cpu")
+        self.transformer.to(device)
+        torch.cuda.empty_cache()
 
         return DiffusionOutput(output=output)
 
