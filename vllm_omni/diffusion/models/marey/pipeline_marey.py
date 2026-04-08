@@ -248,6 +248,7 @@ def _setup_opensora_imports():
     """Prepare sys.modules so opensora VAE can be imported."""
     repo_root = Path("/home/aormazabal/wlam/wlam-inference/").resolve()
     moonvalley_dir = str(repo_root / "moonvalley_ai")
+    print(f'Resolved moonvalley_ai path: {moonvalley_dir}')
     if moonvalley_dir not in sys.path:
         sys.path.insert(0, moonvalley_dir)
 
@@ -277,7 +278,12 @@ def _load_vae(vae_config: dict, device: torch.device, dtype: torch.dtype):
 
     try:
         _setup_opensora_imports()
+        logger.info(f'Setup Opensora imports')
+        root_logger = logging.getLogger()
+        print(f'Root logger: {root_logger.handlers}')
+        print(f'Root logger level: {root_logger.level}')
         from opensora.models.vae.vae_adapters import PretrainedSpatioTemporalVAETokenizer
+        logger.info(f'Import Opensora, loading VAE from {vae_path} with vae_config: {vae_config}')
 
         vae = PretrainedSpatioTemporalVAETokenizer(
             cp_path=vae_path,
