@@ -5,99 +5,297 @@
 Marey video generation pipeline for vllm_omni.
 
 Orchestrates:
-    - Text encoding (UL2-style T5 + optional CLIP vector conditioning)
-    - Rectified flow diffusion sampling (via FlowUniPCMultistepScheduler)
+    - Text encoding (UL2 + CLIP + ByT5)
+    - Rectified flow DDPM diffusion sampling
     - VAE decoding
-    - CFG parallel support
 """
 
 from __future__ import annotations
 
-import json
 import logging
+import math
 import os
+import re
+import sys
+import types
 from collections.abc import Iterable
-from typing import Any
+from pathlib import Path
 
 import torch
+import yaml
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoTokenizer, T5EncoderModel
+from transformers import AutoTokenizer, CLIPTextModel, CLIPTokenizer, T5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.marey.marey_transformer import MareyTransformer
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.inputs.data import OmniTextPrompt
-from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_NEGATIVE_PROMPT = (
+    "<synthetic> <scene cut> gopro, bright, contrast, static, overexposed, bright, "
+    "vignette, artifacts, still, noise, texture, scanlines, videogame, 360 camera, "
+    "VR, transition, flare, saturation, distorted, warped, wide angle, contrast, "
+    "saturated, vibrant, glowing, cross dissolve, texture, videogame, saturation, "
+    "cheesy, ugly hands, mutated hands, mutant, disfigured, extra fingers, blown out, "
+    "horrible, blurry, worst quality, bad, transition, dissolve, cross-dissolve, melt, "
+    "fade in, fade out, wobbly, weird, low quality, plastic, stock footage, video camera, "
+    "boring, static"
+)
+
+# Checkpoint key remapping (training → inference naming)
+_CHECKPOINT_KEY_REMAP = [
+    ("y_embedder.vector_embedding_0", "y_embedder.vector_embedding"),
+]
+
 
 # ---------------------------------------------------------------------------
-# Config / model construction helpers
+# Config helpers
 # ---------------------------------------------------------------------------
 
 
-def load_transformer_config(
-    model_path: str,
-    subfolder: str = "transformer",
-    local_files_only: bool = True,
-) -> dict:
-    """Load transformer config from model directory."""
-    if local_files_only:
-        config_path = os.path.join(model_path, subfolder, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                return json.load(f)
+def _load_yaml_config(model_path: str) -> dict:
+    """Load config.yaml from model directory."""
+    config_path = os.path.join(model_path, "config.yaml")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            return yaml.safe_load(f)
+    raise FileNotFoundError(f"Config file not found at {config_path}")
+
+
+def _deep_update(base: dict, override: dict) -> dict:
+    """Recursively merge override into base."""
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_update(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+def _load_config(od_config: OmniDiffusionConfig) -> dict:
+    """Load config.yaml from od_config.model, then apply od_config.model_config overrides."""
+    config = _load_yaml_config(od_config.model)
+    if od_config.model_config:
+        _deep_update(config, od_config.model_config)
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Transformer construction
+# ---------------------------------------------------------------------------
+
+
+def _create_transformer_from_config(
+    model_cfg: dict,
+    te_cfg: dict,
+    in_channels: int,
+    caption_channels: list[int],
+    vector_cond_channels: int | None,
+) -> MareyTransformer:
+    """Build a MareyTransformer from merged config sections."""
+    depth = model_cfg.get("depth", 42)
+    num_heads = model_cfg.get("num_heads", 40)
+    head_dim = model_cfg.get("head_dim", 128)
+    hidden_size = model_cfg.get("hidden_size", num_heads * head_dim)
+    patch_size = tuple(model_cfg.get("patch_size", [1, 2, 2]))
+    depth_single_blocks = model_cfg.get("depth_single_blocks", 28)
+    mlp_ratio = model_cfg.get("mlp_ratio", 4.0)
+    rope_dim = model_cfg.get("rope_dim", -1)
+    rope_channels_ratio = model_cfg.get("rope_channels_ratio", 0.5)
+    qk_norm = model_cfg.get("qk_norm", True)
+    add_pos_embed_at_every_block = model_cfg.get("add_pos_embed_at_every_block", True)
+    learned_pe = model_cfg.get("learned_pe", True)
+
+    ul2_max_length = te_cfg.get("ul2_max_length", 300)
+    byt5_max_length = te_cfg.get("byt5_max_length", 0)
+    if byt5_max_length > 0:
+        model_max_length = [ul2_max_length, byt5_max_length]
     else:
-        try:
-            from huggingface_hub import hf_hub_download
+        model_max_length = ul2_max_length
 
-            config_path = hf_hub_download(repo_id=model_path, filename=f"{subfolder}/config.json")
-            with open(config_path) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+    out_channels = model_cfg.get("out_channels", 2 * in_channels)
+    extra_features_config = model_cfg.get("extra_features_embedders", None)
+    camera_dim = model_cfg.get("camera_dim") if model_cfg.get("sequence_camera_condition", False) else None
+
+    return MareyTransformer(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        hidden_size=hidden_size,
+        depth=depth,
+        depth_single_blocks=depth_single_blocks,
+        num_heads=num_heads,
+        mlp_ratio=mlp_ratio,
+        patch_size=patch_size,
+        caption_channels=caption_channels,
+        model_max_length=model_max_length,
+        vector_cond_channels=vector_cond_channels,
+        qk_norm=qk_norm,
+        rope_channels_ratio=rope_channels_ratio,
+        rope_dim=rope_dim,
+        add_pos_embed_at_every_block=add_pos_embed_at_every_block,
+        class_dropout_prob=0.0,
+        learned_pe=learned_pe,
+        extra_features_config=extra_features_config,
+        camera_dim=camera_dim,
+    )
 
 
-def create_transformer_from_config(config: dict) -> MareyTransformer:
-    """Build a MareyTransformer from a config dict."""
-    field_map = {
-        "in_channels": "in_channels",
-        "out_channels": "out_channels",
-        "hidden_size": "hidden_size",
-        "depth": "depth",
-        "depth_single_blocks": "depth_single_blocks",
-        "num_heads": "num_heads",
-        "mlp_ratio": "mlp_ratio",
-        "patch_size": "patch_size",
-        "caption_channels": "caption_channels",
-        "model_max_length": "model_max_length",
-        "vector_cond_channels": "vector_cond_channels",
-        "qk_norm": "qk_norm",
-        "rope_channels_ratio": "rope_channels_ratio",
-        "rope_dim": "rope_dim",
-        "add_pos_embed_at_every_block": "add_pos_embed_at_every_block",
-        "input_sq_size": "input_sq_size",
-        "class_dropout_prob": "class_dropout_prob",
-        "num_kv_heads": "num_kv_heads",
-        "learned_pe": "learned_pe",
-    }
-    kwargs = {}
-    for config_key, param_name in field_map.items():
-        if config_key in config:
-            val = config[config_key]
-            if config_key == "patch_size" and isinstance(val, list):
-                val = tuple(val)
-            kwargs[param_name] = val
-    return MareyTransformer(**kwargs)
+# ---------------------------------------------------------------------------
+# Extra features
+# ---------------------------------------------------------------------------
+
+
+def _build_extra_features(
+    model_cfg: dict,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    """Build extra feature tensors from config eval values for inference."""
+    extra_cfg = model_cfg.get("extra_features_embedders", {})
+    features: dict[str, torch.Tensor] = {}
+    for feat, params in extra_cfg.items():
+        if feat == "fps":
+            continue
+        ftype = params.get("type", "")
+        if ftype == "SizeEmbedder":
+            if feat == "ar":
+                val = float(height) / float(width)
+            else:
+                val = 1.0
+            features[feat] = torch.tensor([val], device=device, dtype=dtype)
+        elif ftype in ("LabelEmbedder", "OrderedEmbedder"):
+            eval_val = params.get("eval_value", -1)
+            features[feat] = torch.tensor([eval_val], device=device, dtype=torch.long)
+    return features
+
+
+# ---------------------------------------------------------------------------
+# Timestep / guidance schedule
+# ---------------------------------------------------------------------------
+
+
+def _create_flow_timesteps(
+    num_steps: int,
+    shift: float | None = None,
+    num_train_timesteps: int = 1000,
+    tmin: float = 0.001,
+    tmax: float = 1.0,
+    teacher_steps: int = 100,
+    device: torch.device | None = None,
+) -> list[torch.Tensor]:
+    """Create rectified-flow timesteps for distilled inference.
+
+    Matches the reference RFLOW.draw_time + RFlowScheduler.timestep_shift
+    computation order exactly (float64 intermediate via .tolist()).
+    """
+    nt = num_train_timesteps
+    sigmas_f64 = torch.linspace(tmax, tmin, teacher_steps).tolist()
+    timesteps_all = [torch.tensor([t * nt], device=device) for t in sigmas_f64]
+
+    if shift is not None and shift > 0:
+        for i, t in enumerate(timesteps_all):
+            t_norm = t / nt
+            timesteps_all[i] = (shift * t_norm / (1.0 + (shift - 1.0) * t_norm)) * nt
+
+    stride = max(1, teacher_steps // num_steps)
+    return [timesteps_all[i * stride] for i in range(num_steps)]
+
+
+def _build_guidance_schedule(
+    num_steps: int,
+    guidance_scale: float,
+    warmup_steps: int = 4,
+    cooldown_steps: int = 18,
+    guidance_every_n_steps: int = 2,
+) -> list[float]:
+    """Build an oscillating guidance schedule matching the reference RFLOW scheduler.
+
+    During warmup: CFG is always active.
+    During middle: CFG oscillates (active every ``guidance_every_n_steps``).
+    During cooldown: CFG is off (scale=1.0).
+    """
+    cooldown_start = num_steps - cooldown_steps
+
+    schedule = []
+    for i in range(num_steps):
+        if i < warmup_steps:
+            schedule.append(guidance_scale)
+        elif i >= cooldown_start:
+            schedule.append(1.0)
+        else:
+            middle_idx = i - warmup_steps
+            if middle_idx > 0 and (middle_idx - 1) % guidance_every_n_steps == 0:
+                schedule.append(guidance_scale)
+            else:
+                schedule.append(1.0)
+    return schedule
+
+
+# ---------------------------------------------------------------------------
+# VAE loading
+# ---------------------------------------------------------------------------
+
+
+def _setup_opensora_imports():
+    """Prepare sys.modules so opensora VAE can be imported."""
+    repo_root = Path("/home/aormazabal/wlam/wlam-inference/").resolve()
+    moonvalley_dir = str(repo_root / "moonvalley_ai")
+    if moonvalley_dir not in sys.path:
+        sys.path.insert(0, moonvalley_dir)
+
+    for mod_name in (
+        "opensora.models",
+        "opensora.datasets",
+        "opensora.datasets.utils",
+        "opensora.datasets.video_transforms",
+        "opensora.datasets.datasets",
+    ):
+        if mod_name not in sys.modules:
+            stub = types.ModuleType(mod_name)
+            stub.__path__ = []
+            stub.__package__ = mod_name
+            sys.modules[mod_name] = stub
+
+    opensora_models_path = str(repo_root / "moonvalley_ai" / "open_sora" / "opensora" / "models")
+    sys.modules["opensora.models"].__path__ = [opensora_models_path]
+
+
+def _load_vae(vae_config: dict, device: torch.device, dtype: torch.dtype):
+    """Load the opensora spatiotemporal VAE from config."""
+    vae_path = vae_config.get("cp_path", "")
+    if not os.path.exists(vae_path):
+        logger.warning("VAE checkpoint not found at %s. VAE decoding will not be available.", vae_path)
+        return None
+
+    try:
+        _setup_opensora_imports()
+        from opensora.models.vae.vae_adapters import PretrainedSpatioTemporalVAETokenizer
+
+        vae = PretrainedSpatioTemporalVAETokenizer(
+            cp_path=vae_path,
+            strict_loading=vae_config.get("strict_loading", False),
+            extra_kwargs=vae_config.get("extra_kwargs", {"no_losses": True}),
+            scaling_factor=vae_config.get("scaling_factor", 1.0),
+            bias_factor=vae_config.get("bias_factor", 0.0),
+            frame_chunk_len=vae_config.get("frame_chunk_len"),
+            max_batch_size=vae_config.get("max_batch_size"),
+            reuse_as_spatial_vae=vae_config.get("reuse_as_spatial_vae", False),
+            extra_context_and_drop_strategy=vae_config.get("extra_context_and_drop_strategy", False),
+        )
+        vae = vae.to(device, dtype).eval()
+        logger.info("Loaded opensora VAE (out_channels=%s, downsample=%s)", vae.out_channels, vae.downsample_factors)
+        return vae
+    except Exception as e:
+        logger.warning("Could not load opensora VAE (%s). Output will be raw latents.", e)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +330,7 @@ def get_marey_pre_process_func(od_config: OmniDiffusionConfig):
             multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
             raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
             if isinstance(prompt, str):
+                from vllm_omni.inputs.data import OmniTextPrompt
                 prompt = OmniTextPrompt(prompt=prompt)
             if "additional_information" not in prompt:
                 prompt["additional_information"] = {}
@@ -163,16 +362,27 @@ def get_marey_pre_process_func(od_config: OmniDiffusionConfig):
 
 
 # ---------------------------------------------------------------------------
+# Text helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_quotes(text: str) -> str:
+    """Extract text between quotes for ByT5 encoding.
+    Returns the full prompt if no quotes are found."""
+    matches = re.findall(r'["\u201c\u201d](.*?)["\u201c\u201d]', text)
+    return " ".join(matches) if matches else text
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
 
-class MareyPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
+class MareyPipeline(nn.Module, ProgressBarMixin):
     """Marey MMDiT video generation pipeline.
 
-    Follows the Wan22Pipeline pattern:
-        __init__  -> load text encoder, VAE, transformer, scheduler
-        forward   -> encode prompt, prepare latents, denoise loop, decode
+    All configuration is read from config.yaml in the model directory
+    (od_config.model), with od_config.model_config providing overrides.
     """
 
     def __init__(
@@ -186,8 +396,12 @@ class MareyPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
 
-        model = od_config.model
-        local_files_only = os.path.exists(model)
+        # Load merged config
+        self.config = _load_config(od_config)
+        te_cfg = self.config.get("text_encoder", {})
+        vae_cfg = self.config.get("vae", {})
+        model_cfg = self.config.get("model", {})
+        sched_cfg = self.config.get("scheduler", {})
 
         # Weight sources for DiffusersPipelineLoader
         self.weights_sources = [
@@ -200,59 +414,57 @@ class MareyPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             ),
         ]
 
-        # Text encoder
-        text_encoder_subfolder = "text_encoder"
-        if local_files_only and not os.path.exists(os.path.join(model, text_encoder_subfolder)):
-            text_encoder_subfolder = "text_encoder_1"
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model, subfolder="tokenizer", local_files_only=local_files_only
+        # -- Text encoders (UL2, CLIP, ByT5) ---------------------------------
+        ul2_name = te_cfg.get("ul2_pretrained", "google/ul2")
+        clip_name = te_cfg.get("clip_pretrained", "laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90K")
+        byt5_name = te_cfg.get("byt5_pretrained", "google/byt5-large")
+        self.ul2_max_length = te_cfg.get("ul2_max_length", 300)
+        self.clip_max_length = te_cfg.get("clip_max_length", 77)
+        self.byt5_max_length = te_cfg.get("byt5_max_length", 70)
+
+        self.ul2_tokenizer = AutoTokenizer.from_pretrained(ul2_name)
+        self.ul2_model = T5EncoderModel.from_pretrained(ul2_name, torch_dtype=dtype).to(self.device).eval()
+
+        self.clip_tokenizer = CLIPTokenizer.from_pretrained(clip_name)
+        self.clip_model = CLIPTextModel.from_pretrained(clip_name, torch_dtype=dtype).to(self.device).eval()
+
+        self.byt5_tokenizer = AutoTokenizer.from_pretrained(byt5_name)
+        self.byt5_model = T5EncoderModel.from_pretrained(byt5_name, torch_dtype=dtype).to(self.device).eval()
+
+        # -- VAE --------------------------------------------------------------
+        self.vae = _load_vae(vae_cfg, self.device, dtype)
+        self.vae_downsample_factors = tuple(vae_cfg.get("downsample_factors", (4, 16, 16)))
+        self.vae_scale_factor_temporal = self.vae_downsample_factors[0]
+        self.vae_scale_factor_spatial = self.vae_downsample_factors[1]
+
+        # -- Transformer ------------------------------------------------------
+        in_channels = len(vae_cfg.get("scaling_factor", [0] * 16))
+        # Caption channels: UL2 hidden dim, ByT5 hidden dim
+        caption_channels = [self.ul2_model.config.d_model, self.byt5_model.config.d_model]
+        vector_cond_channels = self.clip_model.config.hidden_size
+        self.transformer = _create_transformer_from_config(
+            model_cfg, te_cfg, in_channels, caption_channels, vector_cond_channels,
         )
-        self.text_encoder = T5EncoderModel.from_pretrained(
-            model, subfolder=text_encoder_subfolder, torch_dtype=dtype, local_files_only=local_files_only
-        ).to(self.device)
 
-        # VAE
-        self._load_vae(model, dtype, local_files_only)
+        # -- Scheduler config -------------------------------------------------
+        self.num_train_timesteps = 1000
+        self.sched_tmin = sched_cfg.get("tmin", 0.001)
+        self.sched_tmax = sched_cfg.get("tmax", 1.0)
+        self.sched_teacher_steps = sched_cfg.get("num_sampling_steps", 100)
+        self.flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 3.0
 
-        # Transformer (weights loaded later via load_weights)
-        transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(transformer_config)
-
-        # Scheduler: rectified flow matching
-        flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 3.0
-        self.scheduler = FlowUniPCMultistepScheduler(
-            num_train_timesteps=1000,
-            shift=flow_shift,
-            prediction_type="flow_prediction",
-        )
-
-        self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4) if self.vae else 4
-        self.vae_scale_factor_spatial = getattr(self.vae.config, "scale_factor_spatial", 8) if self.vae else 8
+        # -- Guidance defaults ------------------------------------------------
+        self.skip_uncond = True  # distilled models skip uncond when scale=1.0
+        self.default_clip_value = 10.0
+        self.default_warmup_steps = 4
+        self.default_cooldown_steps = 18
+        self.default_guidance_every_n_steps = 2
 
         self._guidance_scale = None
         self._num_timesteps = None
         self._current_timestep = None
 
-    def _load_vae(self, model: str, dtype: torch.dtype, local_files_only: bool) -> None:
-        """Load VAE, trying diffusers first, then falling back."""
-        try:
-            from diffusers import AutoencoderKLWan
-
-            self.vae = AutoencoderKLWan.from_pretrained(
-                model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
-            ).to(self.device)
-        except Exception:
-            try:
-                from diffusers import AutoencoderKL
-
-                self.vae = AutoencoderKL.from_pretrained(
-                    model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
-                ).to(self.device)
-            except Exception:
-                logger.warning("Could not load VAE from model directory. VAE decoding will not be available.")
-                self.vae = None
-
-    # -- Properties ----------------------------------------------------------
+    # -- Properties -----------------------------------------------------------
 
     @property
     def guidance_scale(self):
@@ -270,234 +482,69 @@ class MareyPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
     def current_timestep(self):
         return self._current_timestep
 
-    # -- Forward -------------------------------------------------------------
-
-    def forward(
-        self,
-        req: OmniDiffusionRequest,
-        prompt: str | None = None,
-        negative_prompt: str | None = None,
-        height: int = 720,
-        width: int = 1280,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 5.0,
-        frame_num: int = 81,
-        output_type: str | None = "np",
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        **kwargs,
-    ) -> DiffusionOutput:
-        # Extract parameters from request
-        if len(req.prompts) > 1:
-            raise ValueError("This model only supports a single prompt per request.")
-        if len(req.prompts) == 1:
-            prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
-            negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
-        if prompt is None and prompt_embeds is None:
-            raise ValueError("Prompt or prompt_embeds is required.")
-
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
-        num_frames = req.sampling_params.num_frames if req.sampling_params.num_frames else frame_num
-
-        patch_size = self.transformer.patch_size
-        mod_value = self.vae_scale_factor_spatial * patch_size[1]
-        height = (height // mod_value) * mod_value
-        width = (width // mod_value) * mod_value
-        num_steps = req.sampling_params.num_inference_steps or num_inference_steps
-
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
-        self._guidance_scale = guidance_scale
-
-        device = self.device
-        dtype = self.transformer.dtype
-
-        if generator is None:
-            generator = req.sampling_params.generator
-        if generator is None and req.sampling_params.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
-
-        # Text encoding
-        if prompt_embeds is None:
-            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                do_classifier_free_guidance=guidance_scale > 1.0,
-                max_sequence_length=req.sampling_params.max_sequence_length or 512,
-                device=device,
-                dtype=dtype,
-            )
-        else:
-            prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
-            if negative_prompt_embeds is not None:
-                negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
-
-        # Timesteps
-        self.scheduler.set_timesteps(num_steps, device=device)
-        timesteps = self.scheduler.timesteps
-        self._num_timesteps = len(timesteps)
-
-        # Prepare latents
-        if num_frames % self.vae_scale_factor_temporal != 1:
-            num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
-        num_frames = max(num_frames, 1)
-
-        num_channels_latents = self.transformer.in_channels
-        latents = self.prepare_latents(
-            batch_size=prompt_embeds.shape[0],
-            num_channels_latents=num_channels_latents,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            dtype=torch.float32,
-            device=device,
-            generator=generator,
-            latents=req.sampling_params.latents,
-        )
-
-        # Prepare conditioning tensors
-        height_tensor = torch.tensor([height], device=device, dtype=dtype)
-        width_tensor = torch.tensor([width], device=device, dtype=dtype)
-        fps_value = req.sampling_params.fps if hasattr(req.sampling_params, "fps") and req.sampling_params.fps else 24
-        fps_tensor = torch.tensor([fps_value], device=device, dtype=dtype)
-
-        # Denoising loop
-        with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
-                self._current_timestep = t
-                latent_model_input = latents.to(dtype)
-                timestep = t.expand(latents.shape[0])
-
-                do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
-                positive_kwargs = {
-                    "hidden_states": latent_model_input,
-                    "timestep": timestep,
-                    "encoder_hidden_states": prompt_embeds,
-                    "encoder_hidden_states_mask": None,
-                    "height": height_tensor,
-                    "width": width_tensor,
-                    "fps": fps_tensor,
-                    "return_dict": False,
-                }
-                if do_true_cfg:
-                    negative_kwargs = {
-                        "hidden_states": latent_model_input,
-                        "timestep": timestep,
-                        "encoder_hidden_states": negative_prompt_embeds,
-                        "encoder_hidden_states_mask": None,
-                        "height": height_tensor,
-                        "width": width_tensor,
-                        "fps": fps_tensor,
-                        "return_dict": False,
-                    }
-                else:
-                    negative_kwargs = None
-
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_true_cfg,
-                    true_cfg_scale=guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=False,
-                )
-
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
-                pbar.update()
-
-        if current_omni_platform.is_available():
-            current_omni_platform.empty_cache()
-        self._current_timestep = None
-
-        # VAE decode
-        if output_type == "latent" or self.vae is None:
-            output = latents
-        else:
-            latents_for_decode = latents.to(self.vae.dtype)
-            if hasattr(self.vae.config, "latents_mean"):
-                latents_mean = (
-                    torch.tensor(self.vae.config.latents_mean)
-                    .view(1, self.vae.config.z_dim, 1, 1, 1)
-                    .to(latents_for_decode.device, latents_for_decode.dtype)
-                )
-                latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
-                    1, self.vae.config.z_dim, 1, 1, 1
-                ).to(latents_for_decode.device, latents_for_decode.dtype)
-                latents_for_decode = latents_for_decode / latents_std + latents_mean
-            output = self.vae.decode(latents_for_decode, return_dict=False)[0]
-
-        return DiffusionOutput(output=output)
-
-    def predict_noise(self, **kwargs: Any) -> torch.Tensor:
-        return self.transformer(**kwargs)[0]
-
     # -- Text encoding -------------------------------------------------------
 
     def encode_prompt(
         self,
-        prompt: str | list[str],
-        negative_prompt: str | list[str] | None = None,
-        do_classifier_free_guidance: bool = True,
-        max_sequence_length: int = 512,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        device = device or self.device
-        dtype = dtype or self.text_encoder.dtype
+        prompt: str,
+        device: torch.device,
+        dtype: torch.dtype,
+        quote_override: str | None = None,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
+        """Encode text using UL2 (sequence), CLIP (vector), and ByT5 (quotes).
 
-        prompt = [prompt] if isinstance(prompt, str) else prompt
-        batch_size = len(prompt)
-
-        text_inputs = self.tokenizer(
+        Returns (seq_cond, seq_cond_masks, vector_cond).
+        """
+        # UL2
+        ul2_inputs = self.ul2_tokenizer(
             prompt,
             padding="max_length",
-            max_length=max_sequence_length,
+            max_length=self.ul2_max_length,
             truncation=True,
-            add_special_tokens=True,
             return_attention_mask=True,
             return_tensors="pt",
         )
-        ids, mask = text_inputs.input_ids, text_inputs.attention_mask
-        seq_lens = mask.gt(0).sum(dim=1).long()
+        ul2_mask = ul2_inputs["attention_mask"].to(device, torch.bool)
+        with torch.no_grad():
+            ul2_output = self.ul2_model(
+                input_ids=ul2_inputs.input_ids.to(device),
+                attention_mask=ul2_inputs.attention_mask.to(device),
+            )
+            ul2_seq = ul2_output.last_hidden_state.to(dtype)
 
-        prompt_embeds = self.text_encoder(ids.to(device), mask.to(device)).last_hidden_state
-        prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
-
-        # Trim to actual lengths then re-pad
-        prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
-        prompt_embeds = torch.stack(
-            [torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))]) for u in prompt_embeds],
-            dim=0,
+        # CLIP
+        clip_inputs = self.clip_tokenizer(
+            [prompt],
+            padding="max_length",
+            max_length=self.clip_max_length,
+            truncation=True,
+            return_tensors="pt",
         )
+        with torch.no_grad():
+            clip_output = self.clip_model(input_ids=clip_inputs["input_ids"].to(device))
+            vector_cond = clip_output.pooler_output.to(dtype)
 
-        negative_prompt_embeds = None
-        if do_classifier_free_guidance:
-            negative_prompt = negative_prompt or ""
-            negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
-            neg_text_inputs = self.tokenizer(
-                negative_prompt,
-                padding="max_length",
-                max_length=max_sequence_length,
-                truncation=True,
-                add_special_tokens=True,
-                return_attention_mask=True,
-                return_tensors="pt",
+        # ByT5
+        quote_text = quote_override if quote_override is not None else _extract_quotes(prompt)
+        byt5_inputs = self.byt5_tokenizer(
+            quote_text,
+            padding="max_length",
+            max_length=self.byt5_max_length,
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        byt5_mask = byt5_inputs["attention_mask"].to(device, torch.bool)
+        with torch.no_grad():
+            byt5_output = self.byt5_model(
+                input_ids=byt5_inputs.input_ids.to(device),
+                attention_mask=byt5_inputs.attention_mask.to(device),
             )
-            ids_neg, mask_neg = neg_text_inputs.input_ids, neg_text_inputs.attention_mask
-            seq_lens_neg = mask_neg.gt(0).sum(dim=1).long()
-            negative_prompt_embeds = self.text_encoder(ids_neg.to(device), mask_neg.to(device)).last_hidden_state
-            negative_prompt_embeds = negative_prompt_embeds.to(dtype=dtype, device=device)
-            negative_prompt_embeds = [u[:v] for u, v in zip(negative_prompt_embeds, seq_lens_neg)]
-            negative_prompt_embeds = torch.stack(
-                [
-                    torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))])
-                    for u in negative_prompt_embeds
-                ],
-                dim=0,
-            )
+            byt5_seq = byt5_output.last_hidden_state.to(dtype)
 
-        return prompt_embeds, negative_prompt_embeds
+        seq_cond = [ul2_seq, byt5_seq]
+        seq_cond_masks = [ul2_mask, byt5_mask]
+        return seq_cond, seq_cond_masks, vector_cond
 
     # -- Latent preparation --------------------------------------------------
 
@@ -508,26 +555,230 @@ class MareyPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         height: int,
         width: int,
         num_frames: int,
-        dtype: torch.dtype | None,
-        device: torch.device | None,
-        generator: torch.Generator | list[torch.Generator] | None,
+        dtype: torch.dtype,
+        device: torch.device,
+        generator: torch.Generator | None,
         latents: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if latents is not None:
             return latents.to(device=device, dtype=dtype)
 
-        num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
-        shape = (
-            batch_size,
-            num_channels_latents,
-            num_latent_frames,
-            int(height) // self.vae_scale_factor_spatial,
-            int(width) // self.vae_scale_factor_spatial,
+        time_pad = 0 if (num_frames % self.vae_scale_factor_temporal == 0) else (
+            self.vae_scale_factor_temporal - num_frames % self.vae_scale_factor_temporal
         )
+        num_latent_frames = (num_frames + time_pad) // self.vae_scale_factor_temporal
+        latent_h = math.ceil(height / self.vae_scale_factor_spatial)
+        latent_w = math.ceil(width / self.vae_scale_factor_spatial)
+        shape = (batch_size, num_channels_latents, num_latent_frames, latent_h, latent_w)
         return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+
+    # -- Forward (DDPM flow-matching loop) -----------------------------------
+
+    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        # -- Extract parameters from request ----------------------------------
+        if len(req.prompts) != 1:
+            raise ValueError("This model only supports a single prompt per request.")
+
+        raw_prompt = req.prompts[0]
+        prompt = raw_prompt if isinstance(raw_prompt, str) else raw_prompt.get("prompt")
+        negative_prompt = None if isinstance(raw_prompt, str) else raw_prompt.get("negative_prompt")
+        if prompt is None:
+            raise ValueError("Prompt is required.")
+
+        sp = req.sampling_params
+        height = sp.height or 720
+        width = sp.width or 1280
+        num_frames = sp.num_frames if sp.num_frames else 33
+        num_steps = sp.num_inference_steps or 100
+        guidance_scale = sp.guidance_scale if sp.guidance_scale_provided else 7.5
+        self._guidance_scale = guidance_scale
+
+        device = self.device
+        dtype = self.transformer.dtype
+
+        generator = sp.generator
+        if generator is None and sp.seed is not None:
+            generator = torch.Generator(device=device).manual_seed(sp.seed)
+
+        # Align height/width to patch grid
+        patch_size = self.transformer.patch_size
+        mod_value = self.vae_scale_factor_spatial * patch_size[1]
+        height = (height // mod_value) * mod_value
+        width = (width // mod_value) * mod_value
+
+        # -- Text encoding ----------------------------------------------------
+        # Reference passes quote_override="" (ByT5 encodes empty string)
+        prompt_embeds, prompt_masks, vector_cond = self.encode_prompt(
+            prompt, device, dtype, quote_override="",
+        )
+
+        use_cfg = guidance_scale > 1.0
+        negative_prompt_embeds = None
+        negative_prompt_masks = None
+        negative_vector_cond = None
+        if use_cfg:
+            neg_text = negative_prompt if negative_prompt is not None else DEFAULT_NEGATIVE_PROMPT
+            negative_prompt_embeds, negative_prompt_masks, negative_vector_cond = self.encode_prompt(
+                neg_text, device, dtype, quote_override="",
+            )
+
+        # -- Timesteps --------------------------------------------------------
+        timesteps = _create_flow_timesteps(
+            num_steps=num_steps,
+            shift=self.flow_shift if self.flow_shift > 0 else None,
+            num_train_timesteps=self.num_train_timesteps,
+            tmin=self.sched_tmin,
+            tmax=self.sched_tmax,
+            teacher_steps=self.sched_teacher_steps,
+            device=device,
+        )
+        self._num_timesteps = len(timesteps)
+
+        # -- Guidance schedule ------------------------------------------------
+        guidance_schedule: list[float] | None = None
+        if use_cfg:
+            guidance_schedule = _build_guidance_schedule(
+                num_steps=num_steps,
+                guidance_scale=guidance_scale,
+                warmup_steps=self.default_warmup_steps,
+                cooldown_steps=self.default_cooldown_steps,
+                guidance_every_n_steps=self.default_guidance_every_n_steps,
+            )
+
+        clip_value = self.default_clip_value
+
+        # -- Prepare latents --------------------------------------------------
+        num_channels_latents = self.transformer.in_channels
+        latents = self.prepare_latents(
+            batch_size=1,
+            num_channels_latents=num_channels_latents,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+            latents=sp.latents,
+        )
+
+        # -- Extra features ---------------------------------------------------
+        model_cfg = self.config.get("model", {})
+        extra_features = _build_extra_features(model_cfg, height, width, device, dtype)
+
+        # -- Conditioning tensors ---------------------------------------------
+        height_t = torch.tensor([height], device=device, dtype=dtype)
+        width_t = torch.tensor([width], device=device, dtype=dtype)
+        fps_value = sp.fps if sp.fps else 24
+        fps_t = torch.tensor([float(fps_value)], device=device, dtype=dtype)
+
+        has_neg = negative_prompt_embeds is not None
+        in_channels = self.transformer.in_channels
+
+        def _model_forward(z_in, t_in, text_emb, vec_cond, text_mask=None, ef=None):
+            raw = self.transformer(
+                hidden_states=z_in.to(dtype),
+                timestep=t_in,
+                encoder_hidden_states=text_emb,
+                encoder_hidden_states_mask=text_mask,
+                vector_cond=vec_cond,
+                height=height_t,
+                width=width_t,
+                fps=fps_t,
+                extra_features=ef if ef is not None else extra_features,
+                return_dict=False,
+            )[0]
+            if raw.shape[1] != in_channels:
+                raw = raw[:, :in_channels]
+            return raw
+
+        # -- DDPM flow-matching denoising loop --------------------------------
+        z = latents
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for i, t in enumerate(timesteps):
+                self._current_timestep = t
+                t_input = t.expand(1)
+
+                # Per-step guidance scale
+                gs_i = guidance_schedule[i] if guidance_schedule is not None else guidance_scale
+                use_uncond = has_neg and ((not self.skip_uncond) or (gs_i > 1.0))
+
+                pred_cond = _model_forward(
+                    z, t_input, prompt_embeds, vector_cond, prompt_masks,
+                )
+
+                if use_uncond:
+                    pred_uncond = _model_forward(
+                        z, t_input, negative_prompt_embeds, negative_vector_cond,
+                        negative_prompt_masks,
+                    )
+                    v_pred = pred_uncond + gs_i * (pred_cond - pred_uncond)
+                else:
+                    v_pred = pred_cond
+
+                # DDPM flow-matching step
+                sigma_t = (t / self.num_train_timesteps).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                x0 = z - sigma_t * v_pred
+                if clip_value is not None and clip_value > 0:
+                    x0 = torch.clamp(x0, -clip_value, clip_value)
+
+                if i < len(timesteps) - 1:
+                    sigma_s = (timesteps[i + 1] / self.num_train_timesteps).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                    alpha_t = 1.0 - sigma_t
+                    alpha_s = 1.0 - sigma_s
+                    alpha_ts = alpha_t / alpha_s
+                    alpha_ts_sq = alpha_ts ** 2
+                    sigma_s_div_t_sq = (sigma_s / sigma_t) ** 2
+                    sigma_ts_div_t_sq = 1.0 - alpha_ts_sq * sigma_s_div_t_sq
+
+                    mean = alpha_ts * sigma_s_div_t_sq * z + alpha_s * sigma_ts_div_t_sq * x0
+                    variance = sigma_ts_div_t_sq * sigma_s ** 2
+
+                    noise = torch.randn_like(z)
+                    z = mean + torch.sqrt(variance) * noise
+                else:
+                    z = x0
+
+                pbar.update()
+
+        self._current_timestep = None
+
+        # -- VAE decode -------------------------------------------------------
+        output_type = sp.output_type or "np"
+        if output_type == "latent" or self.vae is None:
+            output = z
+        else:
+            vae_t_ds = self.vae.downsample_factors[0]
+            num_latent_t = z.shape[2]
+            num_pixel_frames = num_latent_t * vae_t_ds
+            chunk = self.vae.frame_chunk_len
+            if num_latent_t <= 1:
+                num_pixel_frames = 1
+            elif chunk is not None and num_pixel_frames % chunk != 0:
+                num_pixel_frames = (num_pixel_frames // chunk) * chunk
+
+            with torch.no_grad():
+                output = self.vae.decode(
+                    z.to(dtype),
+                    num_frames=num_pixel_frames,
+                    spatial_size=(height, width),
+                )
+            if isinstance(output, tuple):
+                output = output[0]
+
+        return DiffusionOutput(output=output)
 
     # -- Weight loading ------------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Apply key remapping
+        def _remap(items):
+            for name, tensor in items:
+                remapped = name
+                for old, new in _CHECKPOINT_KEY_REMAP:
+                    if old in remapped:
+                        remapped = remapped.replace(old, new)
+                        break
+                yield remapped, tensor
+
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(_remap(weights))
