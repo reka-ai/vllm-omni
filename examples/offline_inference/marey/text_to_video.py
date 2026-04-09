@@ -732,6 +732,16 @@ def generate(
     width_t = torch.tensor([width], device=device, dtype=dtype)
     fps_t = torch.tensor([24.0], device=device, dtype=dtype)
 
+    _dump(dump_dir, "height.pt", height_t)
+    _dump(dump_dir, "width.pt", width_t)
+    _dump(dump_dir, "fps.pt", fps_t)
+    if extra_features is not None:
+        for k, v in extra_features.items():
+            _dump(dump_dir, f"extra_features_{k}.pt", v)
+    if uncond_extra_features is not None:
+        for k, v in uncond_extra_features.items():
+            _dump(dump_dir, f"uncond_extra_features_{k}.pt", v)
+
     has_neg = negative_prompt_embeds is not None
     is_main = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
 
