@@ -733,6 +733,8 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                     v_pred = pred_uncond + gs_i * (pred_cond - pred_uncond)
                 else:
                     v_pred = pred_cond
+                
+                print(f'At step {i}, t: {t}, use_uncond: {use_uncond}, gs_i: {gs_i}, has_neg: {has_neg}, self.skip_uncond: {self.skip_uncond}')
 
                 # DDPM flow-matching step
                 sigma_t = (t / self.num_train_timesteps).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
@@ -795,15 +797,43 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
     # -- Weight loading ------------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Apply key remapping
-        def _remap(items):
-            for name, tensor in items:
-                remapped = name
-                for old, new in _CHECKPOINT_KEY_REMAP:
-                    if old in remapped:
-                        remapped = remapped.replace(old, new)
-                        break
-                yield remapped, tensor
+        # Ignore the provided weights iterator (dummy safetensors) and load
+        # from the actual checkpoint, matching the offline inference loader.
+        import glob
 
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(_remap(weights))
+        import safetensors.torch
+
+        model_dir = self.od_config.model
+        patterns = [
+            os.path.join(model_dir, "epoch0-*", "ema_inference_ckpt.safetensors"),
+            os.path.join(model_dir, "**", "ema_inference_ckpt.safetensors"),
+        ]
+        ckpt_path = None
+        for pat in patterns:
+            matches = sorted(glob.glob(pat, recursive=True))
+            if matches:
+                ckpt_path = matches[0]
+                break
+        if ckpt_path is None:
+            raise FileNotFoundError(
+                f"Cannot find ema_inference_ckpt.safetensors under {model_dir}"
+            )
+
+        logger.info("Loading transformer weights from %s", ckpt_path)
+        state_dict = safetensors.torch.load_file(ckpt_path)
+
+        def _remap_items():
+            for name, tensor in state_dict.items():
+                r = name
+                for old, new in _CHECKPOINT_KEY_REMAP:
+                    if old in r:
+                        r = r.replace(old, new)
+                        break
+                yield r, tensor
+
+        self.transformer.load_weights(_remap_items())
+
+        del state_dict
+        torch.cuda.empty_cache()
+
+        return {name for name, _ in self.named_parameters()}
