@@ -1016,6 +1016,8 @@ def main():
         torch.save(latents.float().cpu(), latent_path)
         print(f"Saved latents to {latent_path}")
 
+        if args.vae_weights:
+            vae_cfg["cp_path"] = args.vae_weights
         vae = load_vae(vae_cfg, device, dtype)
         if vae is not None:
             t0 = time.perf_counter()
