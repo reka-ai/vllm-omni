@@ -639,12 +639,19 @@ class MareyFluxAttention(nn.Module):
                 k_y = k_y_t.transpose(1, 2)
 
         # Concatenate text + visual for joint attention: [B, N_x+N_y, heads, head_dim]
-        q = torch.cat([q_x, q_y], dim=1)
-        k = torch.cat([k_x, k_y], dim=1)
-        v = torch.cat([v_x, v_y], dim=1)
+        # q = torch.cat([q_x, q_y], dim=1)
+        # k = torch.cat([k_x, k_y], dim=1)
+        # v = torch.cat([v_x, v_y], dim=1)
+
+        attn_metadata = AttentionMetadata(
+            joint_query=q_y,
+            joint_key=k_y,
+            joint_value=v_y,
+            joint_strategy="rear",
+        )
 
         # Attention
-        out = self.attn(q, k, v)  # [B, N_x+N_y, heads, head_dim]
+        out = self.attn(q_x, k_x, v_x, attn_metadata=attn_metadata)  # [B, N_x+N_y, heads, head_dim]
         out = out.flatten(2, 3)  # [B, N_x+N_y, dim]
         out = out.type_as(x)
 
@@ -817,12 +824,45 @@ class MareyFinalLayer(nn.Module):
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         shift, scale = self.adaLN_modulation(t).unsqueeze(1).chunk(2, dim=-1)
         x = t2i_modulate(self.norm_final(x), shift, scale)
-        return self.linear(x)
+        x =  self.linear(x)
+        # Reshape to separate T,S
+        x = x.reshape(x.shape[0], x.shape[1], -1) # [B, T, S, C]
+        return x
 
 
 # ---------------------------------------------------------------------------
 # Main Transformer
 # ---------------------------------------------------------------------------
+class SPInputsWrap(nn.Module):
+    """Prepares inputs to be sharded by _sp_plan
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        x_hidden_states: torch.Tensor,
+        temporal_pos: torch.Tensor,
+        spatial_pos_emb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prepare hidden_states for SP.
+
+        Args:
+            y_hidden_states: [batch, img_seq_len, channels]
+            temporal_pos: Temporal position embeddings
+            spatial_pos_emb: Spatial position embeddings
+        """
+        return x_hidden_states, temporal_pos, spatial_pos_emb
+class SPOutputWrap(nn.Module):
+    """Wraps output to be gathered by _sp_plan
+    """
+    def __init__(self):
+        super().__init__()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Gather output from SP.
+        """
+        return x
 
 
 class MareyTransformer(nn.Module):
@@ -859,10 +899,12 @@ class MareyTransformer(nn.Module):
     """
 
     _sp_plan = {
-        "blocks.0": {
-            "x": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
+        "sp_inputs_wrap": {
+            0: SequenceParallelInput(split_dim=2, expected_dims=4, split_output=True),
+            1: SequenceParallelInput(split_dim=2, expected_dims=3, split_output=True),
+            2: SequenceParallelInput(split_dim=2, expected_dims=4, split_output=True),
         },
-        "final_layer": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+        "sp_output_wrap": SequenceParallelOutput(gather_dim=2, expected_dims=4),
     }
 
     def __init__(
@@ -987,6 +1029,10 @@ class MareyTransformer(nn.Module):
         # Final layer
         self.final_layer = MareyFinalLayer(hidden_size, int(np.prod(patch_size)), out_channels)
 
+        #Wrapper for SP
+        self.sp_inputs_wrap = SPInputsWrap()
+        self.sp_output_wrap = SPOutputWrap()
+
     @property
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
@@ -1101,13 +1147,31 @@ class MareyTransformer(nn.Module):
             )
 
         # Prepare spatial_pos_emb for per-block use
-        if self.add_pos_embed_at_every_block:
-            spatial_pos_emb_blocks = spatial_pos_emb.expand(-1, T, -1, -1).reshape(1, T * S, -1)
-        else:
-            spatial_pos_emb_blocks = None
+        # Always create it because sp inputs needs to split it, then if self.add_pos_embed_at_every_block: false set it to None
+        spatial_pos_emb_blocks = spatial_pos_emb.expand(-1, T, -1, -1).reshape(1, T * S, -1)
 
         # Temporal positions for RoPE
         temporal_pos = get_temporal_pos(x, T, S)
+
+        print(f'Shapes before reshape for sp_input_wrap: {x.shape}, {temporal_pos.shape}, {spatial_pos_emb_blocks.shape}')
+        #Pass through SP wrapper for _sp_plan to auto shard them
+        temporal_pos = temporal_pos.reshape(temporal_pos.shape[0], T, S) # [B, T, S]
+        spatial_pos_emb_blocks = spatial_pos_emb_blocks.reshape(spatial_pos_emb.shape[0], T, S, -1) # [1, T, S, C]
+
+        x = x.reshape(B, T, S, -1) # [B, T, S, C]
+        print(f'Shapes after reshape before sp_input_wrap: {x.shape}, {temporal_pos.shape}, {spatial_pos_emb_blocks.shape}')
+        x, temporal_pos, spatial_pos_emb_blocks = self.sp_inputs_wrap(x, temporal_pos, spatial_pos_emb_blocks)
+        S_new = x.shape[2]
+        print(f'S_new: {S_new} | S_old: {S}. Inferred sp degree: {S/S_new}')
+        S_full = S
+        S = S_new
+        x = x.reshape(B, T * S, -1)
+        temporal_pos = temporal_pos.reshape(temporal_pos.shape[0], T*S)
+        spatial_pos_emb_blocks = spatial_pos_emb_blocks.reshape(1, T*S, -1)
+        print(f'Shapes after reshape post sp_input_wrap: {x.shape}, {temporal_pos.shape}, {spatial_pos_emb_blocks.shape}')
+
+        if not self.add_pos_embed_at_every_block:
+            spatial_pos_emb_blocks = None
 
         # Zero out padding text tokens so they don't pollute joint attention
         # (reference: Flux.rearrange_tokens_for_attention applies y * mask)
@@ -1141,8 +1205,14 @@ class MareyTransformer(nn.Module):
             self.blocks[0]._block_diag = False
 
         # Final layer
+        print(f'x shape before final layer: {x.shape}')
         x = self.final_layer(x, t_emb_final)
-
+        x = x.reshape(x.shape[0], T, S, -1)
+        print(f'x shape before sp_output_wrap: {x.shape}')
+        x = self.sp_output_wrap(x)
+        print(f'x shape after sp_output_wrap: {x.shape}')
+        x = x.reshape(x.shape[0], T * S_full, -1)
+        print(f'x shape after reshape: {x.shape}')
         # Unpatchify
         x = self._unpatchify(x, T, H, W, hidden_states)
 

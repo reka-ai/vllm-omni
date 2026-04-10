@@ -291,12 +291,20 @@ def _load_vae(vae_config: dict, device: torch.device, dtype: torch.dtype):
 
     try:
         _setup_opensora_imports()
+        # Patch sp group 
+        # import common.acceleration.parallel_states as opensora_ps
+        # from vllm_omni.diffusion.distributed.parallel_state import get_sp_group, get_sequence_parallel_world_size
+        # opensora_ps.get_sequence_parallel_group = get_sp_group
+        # opensora_ps.get_sequence_parallel_world_size = get_sequence_parallel_world_size
+        # sp_ws = get_sequence_parallel_world_size()
+        sp_ws = 1
         logger.info(f'Setup Opensora imports')
         root_logger = logging.getLogger()
         print(f'Root logger: {root_logger.handlers}')
         print(f'Root logger level: {root_logger.level}')
         from opensora.models.vae.vae_adapters import PretrainedSpatioTemporalVAETokenizer
         logger.info(f'Import Opensora, loading VAE from {vae_path} with vae_config: {vae_config}')
+        print(f'SP WS: {sp_ws}')
 
         vae = PretrainedSpatioTemporalVAETokenizer(
             cp_path=vae_path,
@@ -308,6 +316,7 @@ def _load_vae(vae_config: dict, device: torch.device, dtype: torch.dtype):
             max_batch_size=vae_config.get("max_batch_size"),
             reuse_as_spatial_vae=vae_config.get("reuse_as_spatial_vae", False),
             extra_context_and_drop_strategy=vae_config.get("extra_context_and_drop_strategy", False),
+            enable_sequence_parallelism=sp_ws > 1
         )
         vae = vae.to(device, dtype).eval()
         logger.info("Loaded opensora VAE (out_channels=%s, downsample=%s)", vae.out_channels, vae.downsample_factors)
@@ -629,6 +638,7 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         generator = sp.generator
         if generator is None and sp.seed is not None:
             generator = torch.Generator(device=device).manual_seed(sp.seed)
+        print(f'Generator is: {generator}')
 
 
         # -- Text encoding (offload transformer, load encoders) ---------------
