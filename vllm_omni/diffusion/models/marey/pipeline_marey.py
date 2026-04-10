@@ -906,6 +906,7 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                 _dump(dump_dir, "z_vae_input.pt", z)
                 _dump(dump_dir, "num_frames.pt", num_pixel_frames)
                 _dump(dump_dir, "spatial_size.pt", (height, width))
+                print(f'Decoding with num_pixel_frames: {num_pixel_frames}, spatial_size: {height, width}')
                 output = self.vae.decode(
                     z.to(dtype),
                     num_frames=num_pixel_frames,
@@ -913,6 +914,8 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                 )
             if isinstance(output, tuple):
                 output = output[0]
+            
+            print(f'Vae decoded output shape: {output[0].shape}')
         self.vae.to("cpu")
         self.transformer.to(device)
         torch.cuda.empty_cache()
