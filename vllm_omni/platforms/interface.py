@@ -117,3 +117,7 @@ class OmniPlatform(Platform):
 class UnspecifiedOmniPlatform(OmniPlatform):
     _omni_enum = OmniPlatformEnum.UNSPECIFIED
     device_type = ""
+
+    @classmethod
+    def get_default_stage_config_path(cls) -> str:
+        return "vllm_omni/model_executor/stage_configs"
