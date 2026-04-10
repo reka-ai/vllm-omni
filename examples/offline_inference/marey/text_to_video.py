@@ -319,26 +319,55 @@ def _setup_opensora_imports():
     """
     import types
 
+    # Find moonvalley_ai: check sibling of repo root first, then parent of
+    # the editable opensora install, then fall back to the original location.
     repo_root = Path(__file__).resolve().parents[3]
-    moonvalley_dir = str(repo_root / "moonvalley_ai")
+    candidates = [
+        repo_root / "moonvalley_ai",
+        repo_root.parent / "moonvalley_ai",
+    ]
+    # If opensora is installed as editable, derive moonvalley_ai from its path
+    try:
+        import opensora as _os_pkg
+        _os_installed = Path(_os_pkg.__file__).resolve().parents[2]
+        candidates.insert(0, _os_installed)
+    except Exception:
+        pass
+
+    moonvalley_dir = None
+    for candidate in candidates:
+        if (candidate / "open_sora" / "opensora" / "models" / "vae").is_dir():
+            moonvalley_dir = str(candidate)
+            break
+    if moonvalley_dir is None:
+        moonvalley_dir = str(repo_root / "moonvalley_ai")
+
     if moonvalley_dir not in sys.path:
         sys.path.insert(0, moonvalley_dir)
 
-    for mod_name in (
+    opensora_root = Path(moonvalley_dir) / "open_sora" / "opensora"
+
+    # Stub only the modules whose __init__.py pulls in unrelated heavy
+    # dependencies (stdit -> deepspeed training code, datasets -> dask/wandb).
+    # Registry, utils, and VAE modules must be real so the VAE can construct
+    # its sub-components via build_module / load_checkpoint.
+    stub_modules = [
         "opensora.models",
+        "opensora.models.stdit",
         "opensora.datasets",
         "opensora.datasets.utils",
         "opensora.datasets.video_transforms",
         "opensora.datasets.datasets",
-    ):
+    ]
+    for mod_name in stub_modules:
         if mod_name not in sys.modules:
             stub = types.ModuleType(mod_name)
             stub.__path__ = []
             stub.__package__ = mod_name
             sys.modules[mod_name] = stub
 
-    opensora_models_path = str(repo_root / "moonvalley_ai" / "open_sora" / "opensora" / "models")
-    sys.modules["opensora.models"].__path__ = [opensora_models_path]
+    # Point opensora.models to the real directory so vae subpackage resolves
+    sys.modules["opensora.models"].__path__ = [str(opensora_root / "models")]
 
 
 def load_vae(
