@@ -7,9 +7,9 @@
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8098}"
-OUTPUT_PATH="${OUTPUT_PATH:-marey_output_noquality.mp4}"
 POLL_INTERVAL="${POLL_INTERVAL:-5}"
-
+SEED="${SEED:-0}"
+OUTPUT_PATH="${OUTPUT_PATH:-marey_output_noquality_seed${SEED}.mp4}"
 create_response=$(
   curl -sS -X POST "${BASE_URL}/v1/videos" \
     -H "Accept: application/json" \
@@ -18,7 +18,7 @@ create_response=$(
     -F "num_frames=128" \
     -F "num_inference_steps=33" \
     -F "guidance_scale=3.5" \
-    -F "seed=42"
+    -F "seed=${SEED}"
 )
 
 video_id="$(echo "${create_response}" | jq -r '.id')"

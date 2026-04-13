@@ -615,6 +615,8 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         generator = sp.generator
         if generator is None and sp.seed is not None:
             generator = torch.Generator(device=device).manual_seed(sp.seed)
+        elif generator is None:
+            generator = torch.Generator(device=device).manual_seed(0) # default seed
 
         # -- Text encoding (offload transformer, load encoders) ---------------
         self.transformer.to("cpu")
@@ -673,7 +675,7 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         # -- Prepare latents --------------------------------------------------
         num_channels_latents = self.transformer.in_channels
 
-        print(f'sp.latents: {sp.latents}')
+        # print(f'sp.latents: {sp.latents}')
 
         latents = self.prepare_latents(
             batch_size=1,
@@ -772,7 +774,7 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                     mean = alpha_ts * sigma_s_div_t_sq * z + alpha_s * sigma_ts_div_t_sq * x0
                     variance = sigma_ts_div_t_sq * sigma_s ** 2
 
-                    noise = torch.randn_like(z)
+                    noise = torch.randn_like(z, generator=generator)
                     z = mean + torch.sqrt(variance) * noise
                 else:
                     z = x0
