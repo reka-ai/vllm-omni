@@ -822,12 +822,12 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
 
         # Quality guidance: cond gets quality=0, uncond gets quality=9
         uncond_extra_features = None
-        # if use_cfg:
-        #     uncond_extra_features = dict(extra_features)
-        #     for qkey in ("dover_technical", "aesthetics_score_total"):
-        #         if qkey in extra_features:
-        #             uncond_extra_features[qkey] = torch.tensor([9], device=device, dtype=torch.long)
-        #             extra_features[qkey] = torch.tensor([0], device=device, dtype=torch.long)
+        if use_cfg:
+            uncond_extra_features = dict(extra_features)
+            for qkey in ("dover_technical", "aesthetics_score_total"):
+                if qkey in extra_features:
+                    uncond_extra_features[qkey] = torch.tensor([9], device=device, dtype=torch.long)
+                    extra_features[qkey] = torch.tensor([0], device=device, dtype=torch.long)
 
         _uncond_ef = uncond_extra_features if uncond_extra_features is not None else extra_features
 
