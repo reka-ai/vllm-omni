@@ -41,11 +41,12 @@ You don't need to write SHAs down — `build-serving.sh` attaches per-repo git s
 Use the `build-serving.sh` wrapper. It discovers the sibling layout from its own location, symlinks the correct `.dockerignore` into place for the build, runs `docker build`, and cleans up.
 
 ```bash
-VLLM_OMNI_SHA=$(git -C <parent>/vllm-omni rev-parse HEAD)
-
-<parent>/vllm-omni/docker/build-serving.sh \
-    -t rekaai/vllm-omni:${VLLM_OMNI_SHA} \
-    -t rekaai/vllm-omni:latest
+./docker/build-serving.sh \
+    --build-arg torch_cuda_arch_list="9.0" \
+    --build-arg max_jobs=28 \
+    --build-arg nvcc_threads=4 \
+    -t rekaai/vllm-omni-fork:$(git rev-parse HEAD) \
+    -t rekaai/vllm-omni-fork:latest
 ```
 
 ### Notes
@@ -61,20 +62,20 @@ image. Inspect via `docker inspect`:
 
 ```bash
 # All labels
-docker inspect --format '{{json .Config.Labels}}' rekaai/vllm-omni:${VLLM_OMNI_SHA} | jq
+docker inspect --format '{{json .Config.Labels}}' rekaai/vllm-omni-fork:${VLLM_OMNI_SHA} | jq
 
 # Just the HEAD commit summary for each repo
-docker inspect --format '{{index .Config.Labels "org.reka.vllm-omni.head"}}'     rekaai/vllm-omni:${VLLM_OMNI_SHA}
-docker inspect --format '{{index .Config.Labels "org.reka.vllm-reka.head"}}'     rekaai/vllm-omni:${VLLM_OMNI_SHA}
-docker inspect --format '{{index .Config.Labels "org.reka.moonvalley_ai.head"}}' rekaai/vllm-omni:${VLLM_OMNI_SHA}
+docker inspect --format '{{index .Config.Labels "org.reka.vllm-omni.head"}}'     rekaai/vllm-omni-fork:${VLLM_OMNI_SHA}
+docker inspect --format '{{index .Config.Labels "org.reka.vllm-reka.head"}}'     rekaai/vllm-omni-fork:${VLLM_OMNI_SHA}
+docker inspect --format '{{index .Config.Labels "org.reka.moonvalley_ai.head"}}' rekaai/vllm-omni-fork:${VLLM_OMNI_SHA}
 
 # Recent log for a repo (last 10 commits)
-docker inspect --format '{{index .Config.Labels "org.reka.vllm-omni.log"}}' rekaai/vllm-omni:${VLLM_OMNI_SHA}
+docker inspect --format '{{index .Config.Labels "org.reka.vllm-omni.log"}}' rekaai/vllm-omni-fork:${VLLM_OMNI_SHA}
 
 # Dirty-tree check — if any of these are "true", the image contains
 # uncommitted changes from somebody's working copy. Don't push to prod.
 for repo in vllm-omni vllm-reka moonvalley_ai; do
-    echo "$repo: $(docker inspect --format "{{index .Config.Labels \"org.reka.${repo}.dirty\"}}" rekaai/vllm-omni:${VLLM_OMNI_SHA})"
+    echo "$repo: $(docker inspect --format "{{index .Config.Labels \"org.reka.${repo}.dirty\"}}" rekaai/vllm-omni-fork:${VLLM_OMNI_SHA})"
 done
 ```
 
@@ -98,12 +99,12 @@ Don't push an image you haven't run. SSH into an H100 node (or any CUDA node), p
 
 ```bash
 # On the GPU node
-docker pull rekaai/vllm-omni:${VLLM_OMNI_SHA}
+docker pull rekaai/vllm-omni-fork:${VLLM_OMNI_SHA}
 
 # Plain-vLLM mode (e.g. reka-edge-2603)
 docker run --gpus all --rm -p 8000:8000 \
     -v /path/to/weights:/model \
-    rekaai/vllm-omni:${VLLM_OMNI_SHA} \
+    rekaai/vllm-omni-fork:$(git rev-parse HEAD) \
     vllm serve /model --tokenizer-mode yasa
 
 # In another shell
@@ -116,7 +117,7 @@ docker run --gpus all --rm -p 8000:8000 \
     -v /path/to/marey-distilled-0100:/model \
     -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    rekaai/vllm-omni:${VLLM_OMNI_SHA} \
+    rekaai/vllm-omni-fork:$(git rev-parse HEAD) \
     vllm serve /model --omni \
         --port 8000 \
         --model-class-name MareyPipeline \
@@ -131,16 +132,16 @@ If `/health` returns 200 in both modes, the image is good.
 
 ```bash
 docker login                                           # Reka Docker Hub creds
-docker push rekaai/vllm-omni:${VLLM_OMNI_SHA}
-docker push rekaai/vllm-omni:latest
+docker push rekaai/vllm-omni-fork:$(git rev-parse HEAD)
+docker push rekaai/vllm-omni-fork:latest
 ```
 
 After the push, grab the image's content digest — this is what you'll pin
 in tanka.
 
 ```bash
-docker inspect --format='{{index .RepoDigests 0}}' rekaai/vllm-omni:${VLLM_OMNI_SHA}
-# → rekaai/vllm-omni@sha256:abcdef012345...
+docker inspect --format='{{index .RepoDigests 0}}' rekaai/vllm-omni-fork:$(git rev-parse HEAD)
+# → rekaai/vllm-omni-fork@sha256:abcdef012345...
 ```
 
 ## 5. Update tanka and deploy
@@ -154,7 +155,7 @@ local inference = import 'inference.libsonnet';
   world_model_marey: inference.vllm_omni_inference_server(
     name='world-model-marey',
     // Pin by content digest — covers vllm-omni + vllm-reka + moonvalley_ai.
-    image='rekaai/vllm-omni@sha256:abcdef012345...',
+    image='rekaai/vllm-omni-fork@sha256:abcdef012345...',
     gpu_count=8,
     replicas=1,
     // rclone pulls this dir from OCI models bucket into /model. It must
@@ -210,3 +211,5 @@ Just deploy to a node with that GPU type.
 - `docker/Dockerfile.serving` — the layers.
 - `docker/build-context.dockerignore` — what gets sent to the daemon.
 - `docker/build-serving.sh` — the wrapper that enforces sibling layout.
+
+  MODEL=/app/hf_checkpoints/marey-distilled-0100 MOONVALLEY_AI_ROOT=/app/kwa/moonvalley_ai ./vllm-omni/examples/online_serving/marey/run_server.sh

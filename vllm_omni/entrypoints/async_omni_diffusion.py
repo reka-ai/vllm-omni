@@ -20,6 +20,7 @@ from vllm.transformers_utils.config import get_hf_file_to_dict
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.entrypoints.marey_pipeline_config import configure_local_marey_pipeline
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
@@ -81,6 +82,13 @@ class AsyncOmniDiffusion:
         if engine_input_source is not None:
             self.od_config.omni_kv_config.setdefault("engine_input_source", engine_input_source)
 
+        if configure_local_marey_pipeline(od_config):
+            self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
+            self._executor = ThreadPoolExecutor(max_workers=1)
+            self._closed = False
+            logger.info("AsyncOmniDiffusion initialized with model: %s", model)
+            return
+
         # Diffusers-style models expose `model_index.json` with `_class_name`.
         # Non-diffusers models (e.g. Bagel, NextStep) only have `config.json`,
         # so we fall back to reading that and mapping model_type manually.
@@ -90,6 +98,13 @@ class AsyncOmniDiffusion:
                 if od_config.model_class_name is None:
                     od_config.model_class_name = config_dict.get("_class_name", None)
                 od_config.update_multimodal_support()
+
+                if configure_local_marey_pipeline(od_config):
+                    self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
+                    self._executor = ThreadPoolExecutor(max_workers=1)
+                    self._closed = False
+                    logger.info("AsyncOmniDiffusion initialized with model: %s", model)
+                    return
 
                 tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
                 od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)

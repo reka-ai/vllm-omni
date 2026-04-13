@@ -4,9 +4,11 @@
 # The model directory must contain a config.yaml with text_encoder, vae, model,
 # and scheduler sections (see examples/offline_inference/marey/text_to_video.py).
 #
-# Since the model directory does not have a model_index.json, we must explicitly
-# pass --model-class-name MareyPipeline so that vllm-omni recognises it as a
-# diffusion model and loads the correct pipeline.
+# The model directory has neither model_index.json nor config.json, so stage
+# config auto-detection cannot resolve a model_type and falls through to the
+# default single-stage diffusion factory. --model-class-name MareyPipeline
+# names the pipeline class that the factory should instantiate (looked up in
+# DiffusionModelRegistry at vllm_omni/diffusion/registry.py).
 #
 # Required env vars:
 #   MODEL                - Path to the Marey checkpoint directory (with config.yaml).

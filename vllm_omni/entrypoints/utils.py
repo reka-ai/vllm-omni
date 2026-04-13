@@ -169,7 +169,7 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     return obj
 
 
-def resolve_model_config_path(model: str) -> str:
+def resolve_model_config_path(model: str) -> str | None:
     """Resolve the stage config file path from the model name.
 
     Resolves stage configuration path based on the model type and device type.
@@ -180,11 +180,10 @@ def resolve_model_config_path(model: str) -> str:
         model: Model name or path (used to determine model_type)
 
     Returns:
-        String path to the stage configuration file
-
-    Raises:
-        ValueError: If model_type cannot be determined
-        FileNotFoundError: If no stage config file exists for the model type
+        Path to the stage configuration file, or ``None`` if no stage config
+        can be resolved — either because model_type cannot be determined or
+        because no YAML is registered for the detected model_type. Callers
+        should fall back to ``default_stage_cfg_factory`` in that case.
     """
     # Try to get config from standard transformers format first
     try:
@@ -195,10 +194,10 @@ def resolve_model_config_path(model: str) -> str:
         if file_or_path_exists(model, "model_index.json", revision=None):
             model_type = _try_get_class_name_from_diffusers_config(model)
             if model_type is None:
-                raise ValueError(
-                    f"Could not determine model_type for diffusers model: {model}. "
-                    f"Please ensure the model has 'model_type' in transformer/config.json or model_index.json"
+                logger.debug(
+                    "No '_class_name' in model_index.json for %s; falling back to default stage config.", model
                 )
+                return None
         elif file_or_path_exists(model, "config.json", revision=None):
             # Try to read config.json manually for custom models like Bagel that fail get_config
             # but have a valid config.json with model_type
@@ -207,15 +206,22 @@ def resolve_model_config_path(model: str) -> str:
                 if config_dict and "model_type" in config_dict:
                     model_type = config_dict["model_type"]
                 else:
-                    raise ValueError(f"config.json found but missing 'model_type' for model: {model}")
+                    logger.debug(
+                        "config.json for %s is missing 'model_type'; falling back to default stage config.", model
+                    )
+                    return None
             except Exception as e:
-                raise ValueError(f"Failed to read config.json for model: {model}. Error: {e}") from e
+                logger.debug(
+                    "Failed to read config.json for %s: %s; falling back to default stage config.", model, e
+                )
+                return None
         else:
-            raise ValueError(
-                f"Could not determine model_type for model: {model}. "
-                f"Model is not in standard transformers format and does not have model_index.json. "
-                f"Please ensure the model has proper configuration files with 'model_type' field"
+            logger.debug(
+                "No recognised config format (transformers/diffusers/bare config.json) for %s; "
+                "falling back to default stage config.",
+                model,
             )
+            return None
 
     default_config_path = current_omni_platform.get_default_stage_config_path()
     model_type_str = f"{model_type}.yaml"

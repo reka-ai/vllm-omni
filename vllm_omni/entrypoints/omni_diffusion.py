@@ -11,6 +11,7 @@ from vllm.transformers_utils.config import get_hf_file_to_dict
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.entrypoints.marey_pipeline_config import configure_local_marey_pipeline
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -52,6 +53,10 @@ class OmniDiffusion:
         if engine_input_source is not None:
             self.od_config.omni_kv_config.setdefault("engine_input_source", engine_input_source)
 
+        if configure_local_marey_pipeline(od_config):
+            self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
+            return
+
         # Detect model class and load config
         # Diffusers-style models expose `model_index.json` with `_class_name`.
         # Non-diffusers models (e.g. Bagel, NextStep, GLM-Image) only have `config.json`,
@@ -68,6 +73,10 @@ class OmniDiffusion:
             if od_config.model_class_name is None:
                 od_config.model_class_name = config_dict.get("_class_name", None)
             od_config.update_multimodal_support()
+
+            if configure_local_marey_pipeline(od_config):
+                self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
+                return
 
             if od_config.model_class_name == "DreamIDOmniPipeline":
                 od_config.model_config = config_dict
