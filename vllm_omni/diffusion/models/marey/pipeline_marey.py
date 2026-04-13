@@ -12,6 +12,7 @@ Orchestrates:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -245,13 +246,36 @@ def _build_guidance_schedule(
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def _opensora_logging_guard():
+    """Temporarily lower the root logger level while importing opensora.
+
+    moonvalley_ai's ``common.logging_utils.get_logger`` raises ``ValueError``
+    when the root logger's level is ``>= logging.ERROR`` (40) — a hydra
+    misconfiguration check. Several opensora modules call ``get_logger`` at
+    import time (e.g. ``opensora/models/vae/discriminator.py``), so importing
+    from a vllm-omni process (which runs at ERROR/CRITICAL) trips that guard.
+    This context manager bypasses the check for the import window only and
+    restores the original level afterwards.
+    """
+    root = logging.getLogger()
+    saved = root.level
+    if saved >= logging.ERROR:
+        root.setLevel(logging.WARNING - 1)  # 29, safely < 40
+    try:
+        yield
+    finally:
+        root.setLevel(saved)
+
+
 def _setup_opensora_imports():
     """Prepare sys.modules so opensora VAE can be imported."""
-    repo_root = Path("/home/aormazabal/wlam/wlam-inference/").resolve()
-    moonvalley_dir = str(repo_root / "moonvalley_ai")
+    moonvalley_dir = os.environ.get("MOONVALLEY_AI_PATH", None)
+    moonvalley_dir = Path(moonvalley_dir).resolve()
+    assert moonvalley_dir is not None, "MOONVALLEY_AI_PATH environment variable must be set"
     print(f'Resolved moonvalley_ai path: {moonvalley_dir}')
-    if moonvalley_dir not in sys.path:
-        sys.path.insert(0, moonvalley_dir)
+    if str(moonvalley_dir) not in sys.path:
+        sys.path.insert(0, str(moonvalley_dir))
 
     for mod_name in (
         "opensora.models",
@@ -266,7 +290,7 @@ def _setup_opensora_imports():
             stub.__package__ = mod_name
             sys.modules[mod_name] = stub
 
-    opensora_models_path = str(repo_root / "moonvalley_ai" / "open_sora" / "opensora" / "models")
+    opensora_models_path = str(moonvalley_dir / "open_sora" / "opensora" / "models")
     sys.modules["opensora.models"].__path__ = [opensora_models_path]
 
 
@@ -279,20 +303,14 @@ def _load_vae(vae_config: dict, device: torch.device, dtype: torch.dtype):
 
     try:
         _setup_opensora_imports()
-        # Patch sp group 
-        # import common.acceleration.parallel_states as opensora_ps
-        # from vllm_omni.diffusion.distributed.parallel_state import get_sp_group, get_sequence_parallel_world_size
-        # opensora_ps.get_sequence_parallel_group = get_sp_group
-        # opensora_ps.get_sequence_parallel_world_size = get_sequence_parallel_world_size
-        # sp_ws = get_sequence_parallel_world_size()
-        sp_ws = 1
+
         logger.info(f'Setup Opensora imports')
         root_logger = logging.getLogger()
         print(f'Root logger: {root_logger.handlers}')
         print(f'Root logger level: {root_logger.level}')
-        from opensora.models.vae.vae_adapters import PretrainedSpatioTemporalVAETokenizer
+        with _opensora_logging_guard():
+            from opensora.models.vae.vae_adapters import PretrainedSpatioTemporalVAETokenizer
         logger.info(f'Import Opensora, loading VAE from {vae_path} with vae_config: {vae_config}')
-        print(f'SP WS: {sp_ws}')
 
         vae = PretrainedSpatioTemporalVAETokenizer(
             cp_path=vae_path,
@@ -304,7 +322,7 @@ def _load_vae(vae_config: dict, device: torch.device, dtype: torch.dtype):
             max_batch_size=vae_config.get("max_batch_size"),
             reuse_as_spatial_vae=vae_config.get("reuse_as_spatial_vae", False),
             extra_context_and_drop_strategy=vae_config.get("extra_context_and_drop_strategy", False),
-            enable_sequence_parallelism=sp_ws > 1
+            enable_sequence_parallelism= False
         )
         vae = vae.to(device, dtype).eval()
         logger.info("Loaded opensora VAE (out_channels=%s, downsample=%s)", vae.out_channels, vae.downsample_factors)

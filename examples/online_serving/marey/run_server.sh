@@ -19,9 +19,10 @@ echo "Flow shift: $FLOW_SHIFT"
 # MAREY_DUMP_DIR="/home/aormazabal/wlam/wlam-inference/scratch/pipeline_dump/" \
 # MAREY_LOAD_INITIAL_NOISE="/home/aormazabal/wlam/wlam-inference/moonvalley_ai/scratch/dumped/z_initial_noise.pt" \
 # MAREY_LOAD_STEP_NOISE_DIR="/home/aormazabal/wlam/wlam-inference/moonvalley_ai/scratch/dumped/" \
-HF_HOME="/home/aormazabal/wlam/wlam-inference/scratch/hf_home" \
+HF_HOME="/mnt/localdisk/vllm_omni_hf_cache" \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 VLLM_OMNI_STORAGE_PATH="/home/aormazabal/wlam/wlam-inference/vllm-omni/storage" \
+MOONVALLEY_AI_PATH="/home/aormazabal/wlam/wlam-inference/moonvalley_ai" \
 uv run --project /home/aormazabal/wlam/wlam-inference/vllm-omni vllm-omni serve "$MODEL" --omni \
     --port "$PORT" \
     --model-class-name MareyPipeline \
