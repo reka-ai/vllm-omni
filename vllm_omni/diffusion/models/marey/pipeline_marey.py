@@ -31,6 +31,12 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.marey_serving_runtime import (
+    MareyVAEInitializationError,
+    allow_raw_latent_output,
+    build_request_missing_vae_error,
+    build_startup_missing_vae_error,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.marey.marey_transformer import MareyTransformer
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
@@ -368,12 +374,15 @@ def _setup_opensora_imports():
     sys.modules["opensora.models"].__path__ = [opensora_models_path]
 
 
-def _load_vae(vae_config: dict, device: torch.device, dtype: torch.dtype):
+def _load_vae(
+    vae_config: dict,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[nn.Module | None, str | None]:
     """Load the opensora spatiotemporal VAE from config."""
     vae_path = vae_config.get("cp_path", "")
     if not os.path.exists(vae_path):
-        logger.warning("VAE checkpoint not found at %s. VAE decoding will not be available.", vae_path)
-        return None
+        return None, f"VAE checkpoint not found at {vae_path}."
 
     try:
         _setup_opensora_imports()
@@ -400,10 +409,9 @@ def _load_vae(vae_config: dict, device: torch.device, dtype: torch.dtype):
         )
         vae = vae.to(device, dtype).eval()
         logger.info("Loaded opensora VAE (out_channels=%s, downsample=%s)", vae.out_channels, vae.downsample_factors)
-        return vae
+        return vae, None
     except Exception as e:
-        logger.warning("Could not load opensora VAE (%s). Output will be raw latents.", e)
-        return None
+        return None, f"Could not load opensora VAE from {vae_path}: {type(e).__name__}: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +548,21 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         self.byt5_model = T5EncoderModel.from_pretrained(byt5_name, torch_dtype=dtype).eval().to("cpu")
 
         # -- VAE --------------------------------------------------------------
-        self.vae = _load_vae(vae_cfg, "cpu", dtype)
+        self.allow_raw_latent_output = allow_raw_latent_output(
+            default_output_type=od_config.output_type,
+            model_config=od_config.model_config,
+        )
+        self.vae, self.vae_init_error = _load_vae(vae_cfg, "cpu", dtype)
+        if self.vae is None:
+            if self.allow_raw_latent_output:
+                logger.warning(
+                    "Marey VAE unavailable; latent-only output is enabled. %s",
+                    self.vae_init_error,
+                )
+            else:
+                raise MareyVAEInitializationError(
+                    build_startup_missing_vae_error(self.vae_init_error),
+                )
         self.vae_downsample_factors = tuple(vae_cfg.get("downsample_factors", (4, 16, 16)))
         self.vae_scale_factor_temporal = self.vae_downsample_factors[0]
         self.vae_scale_factor_spatial = self.vae_downsample_factors[1]
@@ -877,12 +899,18 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
 
         # -- VAE decode -------------------------------------------------------
         self.transformer.to("cpu")
-        self.vae.to(device)
         torch.cuda.empty_cache()
-        output_type = sp.output_type or "np"
-        if output_type == "latent" or self.vae is None:
+        output_type = sp.output_type or self.od_config.output_type or "np"
+        if self.vae is None:
+            if output_type != "latent":
+                raise MareyVAEInitializationError(
+                    build_request_missing_vae_error(self.vae_init_error, output_type),
+                )
+            output = z
+        elif output_type == "latent":
             output = z
         else:
+            self.vae.to(device)
             vae_t_ds = self.vae.downsample_factors[0]
             num_latent_t = z.shape[2]
             num_pixel_frames = num_latent_t * vae_t_ds
@@ -900,7 +928,7 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                 )
             if isinstance(output, tuple):
                 output = output[0]
-        self.vae.to("cpu")
+            self.vae.to("cpu")
         self.transformer.to(device)
         torch.cuda.empty_cache()
 
