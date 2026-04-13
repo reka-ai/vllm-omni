@@ -24,24 +24,6 @@ for sibling in vllm-reka moonvalley_ai; do
     fi
 done
 
-DOCKERIGNORE="$CONTEXT_DIR/.dockerignore"
-TEMPLATE="$SCRIPT_DIR/build-context.dockerignore"
-INSTALLED_DOCKERIGNORE=0
-
-if [ -e "$DOCKERIGNORE" ]; then
-    echo "warning: $DOCKERIGNORE already exists; using it as-is (not replacing)." >&2
-else
-    ln -s "$TEMPLATE" "$DOCKERIGNORE"
-    INSTALLED_DOCKERIGNORE=1
-fi
-
-cleanup() {
-    if [ "$INSTALLED_DOCKERIGNORE" = "1" ]; then
-        rm -f "$DOCKERIGNORE"
-    fi
-}
-trap cleanup EXIT
-
 # Per-repo label helpers.
 repo_sha()  { git -C "$1" rev-parse HEAD; }
 repo_head() { git -C "$1" log -1 --format='%h %ai %an: %s'; }

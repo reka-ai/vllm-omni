@@ -1,6 +1,7 @@
-# Applied at the build context root (parent of vllm-omni, vllm-reka, and
-# moonvalley_ai) by docker/build-serving.sh. Ignores everything at the context
-# root except those three sibling repos, then strips common junk inside them.
+# Dockerfile-specific ignore file for docker/Dockerfile.serving. Patterns are
+# still evaluated relative to the build context root (parent of vllm-omni,
+# vllm-reka, and moonvalley_ai). Ignore everything at the context root except
+# those three sibling repos, then strip common junk inside them.
 
 *
 
