@@ -81,10 +81,23 @@ def _deep_update(base: dict, override: dict) -> dict:
 
 
 def _load_config(od_config: OmniDiffusionConfig) -> dict:
-    """Load config.yaml from od_config.model, then apply od_config.model_config overrides."""
+    """Load config.yaml from od_config.model, then apply od_config.model_config overrides.
+
+    Relative paths in the ``vae.cp_path`` field are resolved against the model
+    directory (where config.yaml lives) so a checkpoint with
+    ``cp_path: vae.ckpt`` works regardless of the process CWD or the mount
+    point (``/model``, ``/app/hf_checkpoints/…``, etc.).
+    """
     config = _load_yaml_config(od_config.model)
     if od_config.model_config:
         _deep_update(config, od_config.model_config)
+
+    vae_cfg = config.get("vae")
+    if isinstance(vae_cfg, dict):
+        cp_path = vae_cfg.get("cp_path", "")
+        if cp_path and not os.path.isabs(cp_path):
+            vae_cfg["cp_path"] = os.path.join(od_config.model, cp_path)
+
     return config
 
 

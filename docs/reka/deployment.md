@@ -1,6 +1,6 @@
 # Deploying vllm-omni
 
-Build-and-deploy runbook for the `rekaai/vllm-omni-fork` Docker image. This is similar to how we deploy our vLLM fork, but , but this image layers on the upstream `vllm/vllm-openai` base (no multi-hour CUDA compile) and bundles two siblings: `vllm-reka` (plugin) and `moonvalley_ai` (opensora source for Marey's VAE).
+Build-and-deploy runbook for the `rekaai/vllm-omni-fork` Docker image. Similar to how we deploy our vLLM fork, but this image layers on the upstream `vllm/vllm-openai` base (no multi-hour CUDA compile) and bundles two siblings: `vllm-reka` (plugin) and `moonvalley_ai` (opensora source for Marey's VAE).
 
 References
 - [Deploying our vLLM fork](https://www.notion.so/moonvalley/Deploying-our-vLLM-fork-321cef6731968073b8a4f3b4c903cf58)
@@ -110,12 +110,19 @@ docker run --gpus all --rm -p 8000:8000 \
 curl http://localhost:8000/health
 # → 200 OK
 
-# vllm-omni diffusion mode (marey)
+# vllm-omni diffusion mode (marey) — single-stage pipeline, not --stage-configs-path.
+# The MODEL dir must contain config.yaml, ema_inference_ckpt.safetensors, and vae.ckpt.
 docker run --gpus all --rm -p 8000:8000 \
-    -v /path/to/marey-weights:/model \
-    -v /path/to/stage_configs.yaml:/config/stage_configs.yaml \
+    -v /path/to/marey-distilled-0100:/model \
+    -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
+    -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     rekaai/vllm-omni:${VLLM_OMNI_SHA} \
-    vllm serve /model --omni --stage-configs-path /config/stage_configs.yaml
+    vllm serve /model --omni \
+        --port 8000 \
+        --model-class-name MareyPipeline \
+        --flow-shift 3.0 \
+        --gpu-memory-utilization 0.98 \
+        --ulysses-degree 8
 ```
 
 If `/health` returns 200 in both modes, the image is good.
@@ -150,13 +157,17 @@ local inference = import 'inference.libsonnet';
     image='rekaai/vllm-omni@sha256:abcdef012345...',
     gpu_count=8,
     replicas=1,
+    // rclone pulls this dir from OCI models bucket into /model. It must
+    // contain config.yaml, ema_inference_ckpt.safetensors, and vae.ckpt.
     model='marey/distilled-0100',
-    stage_configs_yaml=importstr 'stage_configs/marey.yaml',
     override_entrypoint=[
       'vllm', 'serve', '/model',
       '--omni',
       '--port', '8000',
-      '--stage-configs-path', '/config/stage_configs.yaml',
+      '--model-class-name', 'MareyPipeline',
+      '--flow-shift', '3.0',
+      '--gpu-memory-utilization', '0.98',
+      '--ulysses-degree', '8',
     ],
     env=[
       { name: 'PYTORCH_CUDA_ALLOC_CONF', value: 'expandable_segments:True' },
