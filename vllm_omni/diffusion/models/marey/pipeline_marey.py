@@ -296,8 +296,18 @@ def _resolve_moonvalley_dir() -> str:
     try:
         import opensora as _os_pkg  # noqa: F401 (import for path discovery)
         candidates.append(Path(_os_pkg.__file__).resolve().parents[2])
+    except ImportError as e:
+        # opensora not installed — expected; fall through to path-based lookup.
+        logger.warning("opensora not importable (%s); falling back to path-based lookup", e)
     except Exception:
-        pass
+        # opensora is installed but its import raised something other than
+        # ImportError (e.g. a broken transitive dep). Surface it so the
+        # failure is debuggable, then continue with the path-based fallback.
+        logger.warning(
+            "opensora is importable but raised during import; "
+            "falling back to path-based lookup",
+            exc_info=True,
+        )
 
     # pipeline_marey.py lives at <repo>/vllm_omni/diffusion/models/marey/,
     # so parents[4] is the repo root and parents[5] is the parent of the repo.
