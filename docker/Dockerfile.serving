@@ -35,13 +35,13 @@ COPY vllm-reka/     /workspace/vllm-reka
 COPY moonvalley_ai/ /workspace/moonvalley_ai
 
 # Install vllm-omni and the vllm-reka plugin into the base image's uv-managed
-# Python env. moonvalley_ai is not pip-installable; it's placed on sys.path
-# at runtime by vllm_omni.diffusion.models.marey.pipeline_marey via the
-# MOONVALLEY_AI_ROOT env var below.
+# Python env. moonvalley_ai/open_sora is not cleanly pip-installable, so keep
+# the source in the image and expose its package root via PYTHONPATH.
 RUN uv pip install --system --no-cache-dir /workspace/vllm-omni
 RUN uv pip install --system --no-cache-dir /workspace/vllm-reka
 
 ENV MOONVALLEY_AI_ROOT=/workspace/moonvalley_ai
+ENV PYTHONPATH=/workspace/moonvalley_ai/open_sora:${PYTHONPATH}
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 

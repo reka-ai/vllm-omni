@@ -346,8 +346,10 @@ def _setup_opensora_imports():
     """Prepare sys.modules so opensora VAE can be imported."""
     moonvalley_dir = _resolve_moonvalley_dir()
     logger.info("Resolved moonvalley_ai path: %s", moonvalley_dir)
-    if moonvalley_dir not in sys.path:
-        sys.path.insert(0, moonvalley_dir)
+    opensora_pkg_root = str(Path(moonvalley_dir) / "open_sora")
+    for candidate in (opensora_pkg_root, moonvalley_dir):
+        if candidate not in sys.path:
+            sys.path.insert(0, candidate)
 
     for mod_name in (
         "opensora.models",
@@ -362,7 +364,7 @@ def _setup_opensora_imports():
             stub.__package__ = mod_name
             sys.modules[mod_name] = stub
 
-    opensora_models_path = str(Path(moonvalley_dir) / "open_sora" / "opensora" / "models")
+    opensora_models_path = str(Path(opensora_pkg_root) / "opensora" / "models")
     sys.modules["opensora.models"].__path__ = [opensora_models_path]
 
 
