@@ -48,18 +48,6 @@ DEFAULT_TRANSFORMER_WEIGHTS = (
 DEFAULT_VAE_WEIGHTS = "/app/wlam/models/checkpoints/marey/vae/epoch_4_step2819000.ckpt"
 
 
-def _dump(dump_dir, filename, data):
-    """Save a tensor or python object to dump_dir/filename. No-op when dump_dir is None."""
-    if dump_dir is None:
-        return
-    path = os.path.join(dump_dir, filename)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if isinstance(data, torch.Tensor):
-        torch.save(data.detach().cpu(), path)
-    else:
-        torch.save(data, path)
-
-
 DEFAULT_NEGATIVE_PROMPT = (
     "<synthetic> <scene cut> gopro, bright, contrast, static, overexposed, bright, "
     "vignette, artifacts, still, noise, texture, scanlines, videogame, 360 camera, "
@@ -106,14 +94,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"], help="Compute dtype.")
     parser.add_argument("--tp", type=int, default=1, help="Tensor parallel size. Use torchrun --nproc_per_node=N for tp > 1.")
     parser.add_argument("--diag", action="store_true", help="Enable DIAG / BLOCK_DIAG diagnostic output from the transformer.")
-    parser.add_argument("--dump-dir", type=str, default=None,
-                        help="Directory to dump intermediate diffusion tensors for debugging.")
-    parser.add_argument("--load-initial-noise", type=str, default=None,
-                        help="Path to a .pt file containing initial noise z to use instead of random. "
-                             "Use this to match the ground truth implementation's noise exactly.")
-    parser.add_argument("--load-step-noise-dir", type=str, default=None,
-                        help="Path to a ground-truth dump dir. Per-step DDPM noise will be "
-                             "loaded from <dir>/step_NNN/ddpm_noise.pt instead of sampled randomly.")
     return parser.parse_args()
 
 
@@ -248,8 +228,6 @@ def encode_text(
     device: torch.device,
     dtype: torch.dtype,
     quote_override: str | None = None,
-    dump_dir: str | None = None,
-    dump_prefix: str = "text_cond",
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor | None]:
     """Encode text using UL2 (sequence), CLIP (vector), and ByT5 (quotes).
 
@@ -274,8 +252,6 @@ def encode_text(
         return_tensors="pt",
     )
     ul2_mask = inputs["attention_mask"].to(device, torch.bool)
-    _dump(dump_dir, f"{dump_prefix}_ul2_input_ids.pt", inputs.input_ids)
-    _dump(dump_dir, f"{dump_prefix}_ul2_attention_mask.pt", inputs.attention_mask)
     with torch.no_grad():
         ul2_output = ul2_model(
             input_ids=inputs.input_ids.to(device),
@@ -324,7 +300,6 @@ def encode_text(
 
     seq_cond = [ul2_seq, byt5_seq]
     seq_cond_masks = [ul2_mask, byt5_mask]
-    print(f'VECTOR COND: {vector_cond.shape}')
     return seq_cond, seq_cond_masks, vector_cond
 
 
@@ -347,7 +322,6 @@ def _setup_opensora_imports():
 
     repo_root = Path(__file__).resolve().parents[4]
     moonvalley_dir = str(repo_root / "moonvalley_ai")
-    print(f'Resolved moonvalley_dir: {moonvalley_dir}')
     if moonvalley_dir not in sys.path:
         sys.path.insert(0, moonvalley_dir)
 
@@ -653,9 +627,6 @@ def generate(
     uncond_extra_features: dict[str, torch.Tensor] | None = None,
     guidance_schedule: list[float] | None = None,
     skip_uncond: bool = False,
-    dump_dir: str | None = None,
-    load_initial_noise: str | None = None,
-    load_step_noise_dir: str | None = None,
 ) -> torch.Tensor:
     """Run the DDPM flow-matching denoising loop and return latents.
 
@@ -676,71 +647,13 @@ def generate(
     in_channels = transformer.in_channels
     shape = (1, in_channels, num_latent_frames, latent_h, latent_w)
 
-    if load_initial_noise is not None:
-        print(f"Loading initial noise from {load_initial_noise}")
-        z = torch.load(load_initial_noise, map_location=device, weights_only=True).to(dtype)
-        assert z.shape == shape, f"Loaded noise shape {z.shape} != expected {shape}"
-    else:
-        z_zeros = torch.zeros(shape, device=device, dtype=dtype)
-        z = torch.randn_like(z_zeros)
-        del z_zeros
-
-    # -- dump timesteps, hparams, initial noise, text embeddings --
-    _dump(dump_dir, "timesteps.pt", torch.stack(timesteps))
-    _dump(dump_dir, "hparams.pt", {
-        "guidance_scale": guidance_scale,
-        "clip_value": clip_value,
-        "skip_uncond": skip_uncond,
-        "num_steps": num_steps,
-        "num_train_timesteps": num_train_timesteps,
-        "sampler": "ddpm",
-        "load_initial_noise": load_initial_noise,
-    })
-    _dump(dump_dir, "z_initial_noise.pt", z)
-    if guidance_schedule is not None:
-        _dump(dump_dir, "guidance_schedule.pt", guidance_schedule)
-
-    # Dump text conditioning
-    if isinstance(prompt_embeds, list):
-        for idx, pe in enumerate(prompt_embeds):
-            _dump(dump_dir, f"text_cond_seq_{idx}.pt", pe)
-    else:
-        _dump(dump_dir, "text_cond_seq.pt", prompt_embeds)
-    if isinstance(prompt_embeds_mask, list):
-        for idx, pm in enumerate(prompt_embeds_mask):
-            _dump(dump_dir, f"text_cond_mask_{idx}.pt", pm)
-    elif prompt_embeds_mask is not None:
-        _dump(dump_dir, "text_cond_mask.pt", prompt_embeds_mask)
-    if vector_cond is not None:
-        _dump(dump_dir, "vector_cond.pt", vector_cond)
-    if negative_prompt_embeds is not None:
-        if isinstance(negative_prompt_embeds, list):
-            for idx, ne in enumerate(negative_prompt_embeds):
-                _dump(dump_dir, f"null_cond_seq_{idx}.pt", ne)
-        else:
-            _dump(dump_dir, "null_cond_seq.pt", negative_prompt_embeds)
-    if negative_prompt_embeds_mask is not None:
-        if isinstance(negative_prompt_embeds_mask, list):
-            for idx, nm in enumerate(negative_prompt_embeds_mask):
-                _dump(dump_dir, f"null_cond_mask_{idx}.pt", nm)
-        else:
-            _dump(dump_dir, "null_cond_mask.pt", negative_prompt_embeds_mask)
-    if negative_vector_cond is not None:
-        _dump(dump_dir, "null_vector_cond.pt", negative_vector_cond)
+    z_zeros = torch.zeros(shape, device=device, dtype=dtype)
+    z = torch.randn_like(z_zeros)
+    del z_zeros
 
     height_t = torch.tensor([height], device=device, dtype=dtype)
     width_t = torch.tensor([width], device=device, dtype=dtype)
     fps_t = torch.tensor([24.0], device=device, dtype=dtype)
-
-    _dump(dump_dir, "height.pt", height_t)
-    _dump(dump_dir, "width.pt", width_t)
-    _dump(dump_dir, "fps.pt", fps_t)
-    if extra_features is not None:
-        for k, v in extra_features.items():
-            _dump(dump_dir, f"extra_features_{k}.pt", v)
-    if uncond_extra_features is not None:
-        for k, v in uncond_extra_features.items():
-            _dump(dump_dir, f"uncond_extra_features_{k}.pt", v)
 
     has_neg = negative_prompt_embeds is not None
     is_main = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
@@ -773,10 +686,6 @@ def generate(
         return raw
 
     for i, t in enumerate(timesteps):
-        _step = f"step_{i:03d}"
-        _dump(dump_dir, f"{_step}/z_input.pt", z)
-        _dump(dump_dir, f"{_step}/t.pt", t)
-
         t_input = t.expand(1)
 
         # Determine per-step guidance scale from schedule or constant
@@ -787,23 +696,13 @@ def generate(
         # When skip_uncond=True and scale is 1.0, skip the unconditional pass entirely.
         use_uncond = has_neg and ((not skip_uncond) or (gs_i > 1.0))
 
-        _dump(dump_dir, f"{_step}/guidance_metadata.pt", {
-            "guidance_scale_effective": float(gs_i),
-            "use_uncond": use_uncond,
-            "skip_uncond": skip_uncond,
-        })
-
         pred_cond = _model_forward(z, t_input, prompt_embeds, vector_cond, prompt_embeds_mask, ef=extra_features)
-        _dump(dump_dir, f"{_step}/pred_cond.pt", pred_cond)
 
         if use_uncond:
             pred_uncond = _model_forward(z, t_input, negative_prompt_embeds, negative_vector_cond, negative_prompt_embeds_mask, ef=_uncond_ef)
-            _dump(dump_dir, f"{_step}/pred_uncond.pt", pred_uncond)
             v_pred = pred_uncond + gs_i * (pred_cond - pred_uncond)
         else:
             v_pred = pred_cond
-
-        _dump(dump_dir, f"{_step}/v_pred_combined.pt", v_pred)
 
         # DDPM flow-matching step (matches RFLOW reference sampler: ddpm)
         sigma_t = (t / num_train_timesteps).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
@@ -824,21 +723,10 @@ def generate(
             mean = alpha_ts * sigma_s_div_t_sq * z + alpha_s * sigma_ts_div_t_sq * x0
             variance = sigma_ts_div_t_sq * sigma_s ** 2
 
-            if load_step_noise_dir is not None:
-                print(f'Loading step {i} noise from {load_step_noise_dir}')
-                noise = torch.load(
-                    os.path.join(load_step_noise_dir, f"step_{i:03d}", "ddpm_noise.pt"),
-                    map_location=device, weights_only=True,
-                ).to(dtype)
-            else:
-                noise = torch.randn_like(z)
-            _dump(dump_dir, f"{_step}/ddpm_noise.pt", noise)
+            noise = torch.randn_like(z)
             z = mean + torch.sqrt(variance) * noise
         else:
             z = x0
-
-        _dump(dump_dir, f"{_step}/x0_pred.pt", x0)
-        _dump(dump_dir, f"{_step}/z_updated.pt", z)
 
         if is_main and ((i + 1) % 5 == 0 or i == 0 or i == len(timesteps) - 1):
             zf = z.float()
@@ -846,9 +734,6 @@ def generate(
                   f"v_pred std={v_pred.float().std().item():.4f} "
                   f"x0 std={x0.float().std().item():.4f} "
                   f"z std={zf.std().item():.4f}")
-        if i == 0 and is_main:
-            torch.save(x0.cpu(), "x0_step0.pt")
-            print("  Saved x0_step0.pt for analysis")
 
     return z
 
@@ -947,7 +832,6 @@ def main():
         # out in marey_inference.py), so ByT5 encodes an empty string.
         prompt_embeds, prompt_masks, vector_cond = encode_text(
             args.prompt, encoders, device, dtype, quote_override="",
-            dump_dir=args.dump_dir, dump_prefix="ul2_positive",
         )
         t_encode = time.perf_counter() - t0
         seq_shapes = [s.shape for s in prompt_embeds] if isinstance(prompt_embeds, list) else prompt_embeds.shape
@@ -959,7 +843,6 @@ def main():
         if use_cfg:
             negative_prompt_embeds, negative_prompt_masks, negative_vector_cond = encode_text(
                 negative_prompt_text, encoders, device, dtype, quote_override="",
-                dump_dir=args.dump_dir, dump_prefix="ul2_negative",
             )
             print(f"Negative prompt encoded  (CFG scale={args.guidance_scale})")
 
@@ -1116,9 +999,6 @@ def main():
         uncond_extra_features=uncond_extra_features,
         guidance_schedule=guidance_sched,
         skip_uncond=skip_uncond,
-        dump_dir=args.dump_dir,
-        load_initial_noise=args.load_initial_noise,
-        load_step_noise_dir=args.load_step_noise_dir,
     )
     t_gen = time.perf_counter() - t0
     if rank == 0:

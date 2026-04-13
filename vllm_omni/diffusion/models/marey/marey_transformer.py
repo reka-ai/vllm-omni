@@ -1153,22 +1153,18 @@ class MareyTransformer(nn.Module):
         # Temporal positions for RoPE
         temporal_pos = get_temporal_pos(x, T, S)
 
-        print(f'Shapes before reshape for sp_input_wrap: {x.shape}, {temporal_pos.shape}, {spatial_pos_emb_blocks.shape}')
         #Pass through SP wrapper for _sp_plan to auto shard them
         temporal_pos = temporal_pos.reshape(temporal_pos.shape[0], T, S) # [B, T, S]
         spatial_pos_emb_blocks = spatial_pos_emb_blocks.reshape(spatial_pos_emb.shape[0], T, S, -1) # [1, T, S, C]
 
         x = x.reshape(B, T, S, -1) # [B, T, S, C]
-        print(f'Shapes after reshape before sp_input_wrap: {x.shape}, {temporal_pos.shape}, {spatial_pos_emb_blocks.shape}')
         x, temporal_pos, spatial_pos_emb_blocks = self.sp_inputs_wrap(x, temporal_pos, spatial_pos_emb_blocks)
         S_new = x.shape[2]
-        print(f'S_new: {S_new} | S_old: {S}. Inferred sp degree: {S/S_new}')
         S_full = S
         S = S_new
         x = x.reshape(B, T * S, -1)
         temporal_pos = temporal_pos.reshape(temporal_pos.shape[0], T*S)
         spatial_pos_emb_blocks = spatial_pos_emb_blocks.reshape(1, T*S, -1)
-        print(f'Shapes after reshape post sp_input_wrap: {x.shape}, {temporal_pos.shape}, {spatial_pos_emb_blocks.shape}')
 
         if not self.add_pos_embed_at_every_block:
             spatial_pos_emb_blocks = None
@@ -1205,14 +1201,10 @@ class MareyTransformer(nn.Module):
             self.blocks[0]._block_diag = False
 
         # Final layer
-        print(f'x shape before final layer: {x.shape}')
         x = self.final_layer(x, t_emb_final)
         x = x.reshape(x.shape[0], T, S, -1)
-        print(f'x shape before sp_output_wrap: {x.shape}')
         x = self.sp_output_wrap(x)
-        print(f'x shape after sp_output_wrap: {x.shape}')
         x = x.reshape(x.shape[0], T * S_full, -1)
-        print(f'x shape after reshape: {x.shape}')
         # Unpatchify
         x = self._unpatchify(x, T, H, W, hidden_states)
 

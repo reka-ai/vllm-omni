@@ -38,18 +38,6 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 logger = logging.getLogger(__name__)
 
 
-def _dump(dump_dir, filename, data):
-    """Save a tensor or python object to dump_dir/filename. No-op when dump_dir is None."""
-    if dump_dir is None:
-        return
-    path = os.path.join(dump_dir, filename)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if isinstance(data, torch.Tensor):
-        torch.save(data.detach().cpu(), path)
-    else:
-        torch.save(data, path)
-
-
 DEFAULT_NEGATIVE_PROMPT = (
     "<synthetic> <scene cut> gopro, bright, contrast, static, overexposed, bright, "
     "vignette, artifacts, still, noise, texture, scanlines, videogame, 360 camera, "
@@ -492,11 +480,6 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         self._num_timesteps = None
         self._current_timestep = None
 
-        # Dump / load instrumentation (controlled via environment variables)
-        self.dump_dir = os.environ.get("MAREY_DUMP_DIR", None)
-        self.load_initial_noise = os.environ.get("MAREY_LOAD_INITIAL_NOISE", None)
-        self.load_step_noise_dir = os.environ.get("MAREY_LOAD_STEP_NOISE_DIR", None)
-
     # -- Properties -----------------------------------------------------------
 
     @property
@@ -523,14 +506,11 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         device: torch.device,
         dtype: torch.dtype,
         quote_override: str | None = None,
-        dump_prefix: str | None = None,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
         """Encode text using UL2 (sequence), CLIP (vector), and ByT5 (quotes).
 
         Returns (seq_cond, seq_cond_masks, vector_cond).
         """
-        dump_dir = self.dump_dir
-
         # UL2
         ul2_inputs = self.ul2_tokenizer(
             prompt,
@@ -541,9 +521,6 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
             return_tensors="pt",
         )
         ul2_mask = ul2_inputs["attention_mask"].to(device, torch.bool)
-        if dump_prefix is not None:
-            _dump(dump_dir, f"{dump_prefix}_ul2_input_ids.pt", ul2_inputs.input_ids)
-            _dump(dump_dir, f"{dump_prefix}_ul2_attention_mask.pt", ul2_inputs.attention_mask)
         with torch.no_grad():
             ul2_output = self.ul2_model(
                 input_ids=ul2_inputs.input_ids.to(device),
@@ -638,8 +615,6 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         generator = sp.generator
         if generator is None and sp.seed is not None:
             generator = torch.Generator(device=device).manual_seed(sp.seed)
-        print(f'Generator is: {generator}')
-
 
         # -- Text encoding (offload transformer, load encoders) ---------------
         self.transformer.to("cpu")
@@ -648,12 +623,9 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         self.clip_model.to(device)
         self.byt5_model.to(device)
 
-        dump_dir = self.dump_dir
-
         # Reference passes quote_override="" (ByT5 encodes empty string)
         prompt_embeds, prompt_masks, vector_cond = self.encode_prompt(
             prompt, device, dtype, quote_override="",
-            dump_prefix="ul2_positive" if dump_dir else None,
         )
 
         use_cfg = guidance_scale > 1.0
@@ -664,7 +636,6 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
             neg_text = negative_prompt if negative_prompt is not None else DEFAULT_NEGATIVE_PROMPT
             negative_prompt_embeds, negative_prompt_masks, negative_vector_cond = self.encode_prompt(
                 neg_text, device, dtype, quote_override="",
-                dump_prefix="ul2_negative" if dump_dir else None,
             )
 
         # Offload encoders, reload transformer
@@ -702,13 +673,7 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         # -- Prepare latents --------------------------------------------------
         num_channels_latents = self.transformer.in_channels
 
-        # Optionally load initial noise from a previous dump
-        loaded_latents = None
-        if self.load_initial_noise is not None:
-            logger.info("Loading initial noise from %s", self.load_initial_noise)
-            loaded_latents = torch.load(
-                self.load_initial_noise, map_location=device, weights_only=True,
-            ).to(dtype)
+        print(f'sp.latents: {sp.latents}')
 
         latents = self.prepare_latents(
             batch_size=1,
@@ -719,51 +684,8 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
             dtype=dtype,
             device=device,
             generator=generator,
-            latents=loaded_latents if loaded_latents is not None else sp.latents,
+            latents=sp.latents,
         )
-
-        # -- Dump pre-loop tensors --------------------------------------------
-        _dump(dump_dir, "timesteps.pt", torch.stack(timesteps))
-        _dump(dump_dir, "hparams.pt", {
-            "guidance_scale": guidance_scale,
-            "clip_value": clip_value,
-            "skip_uncond": self.skip_uncond,
-            "num_steps": num_steps,
-            "num_train_timesteps": self.num_train_timesteps,
-            "sampler": "ddpm",
-            "load_initial_noise": self.load_initial_noise,
-        })
-        _dump(dump_dir, "z_initial_noise.pt", latents)
-        if guidance_schedule is not None:
-            _dump(dump_dir, "guidance_schedule.pt", guidance_schedule)
-
-        # Dump text conditioning
-        if isinstance(prompt_embeds, list):
-            for idx, pe in enumerate(prompt_embeds):
-                _dump(dump_dir, f"text_cond_seq_{idx}.pt", pe)
-        else:
-            _dump(dump_dir, "text_cond_seq.pt", prompt_embeds)
-        if isinstance(prompt_masks, list):
-            for idx, pm in enumerate(prompt_masks):
-                _dump(dump_dir, f"text_cond_mask_{idx}.pt", pm)
-        elif prompt_masks is not None:
-            _dump(dump_dir, "text_cond_mask.pt", prompt_masks)
-        if vector_cond is not None:
-            _dump(dump_dir, "vector_cond.pt", vector_cond)
-        if negative_prompt_embeds is not None:
-            if isinstance(negative_prompt_embeds, list):
-                for idx, ne in enumerate(negative_prompt_embeds):
-                    _dump(dump_dir, f"null_cond_seq_{idx}.pt", ne)
-            else:
-                _dump(dump_dir, "null_cond_seq.pt", negative_prompt_embeds)
-        if negative_prompt_masks is not None:
-            if isinstance(negative_prompt_masks, list):
-                for idx, nm in enumerate(negative_prompt_masks):
-                    _dump(dump_dir, f"null_cond_mask_{idx}.pt", nm)
-            else:
-                _dump(dump_dir, "null_cond_mask.pt", negative_prompt_masks)
-        if negative_vector_cond is not None:
-            _dump(dump_dir, "null_vector_cond.pt", negative_vector_cond)
 
         # -- Extra features ---------------------------------------------------
         model_cfg = self.config.get("model", {})
@@ -785,15 +707,6 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         width_t = torch.tensor([width], device=device, dtype=dtype)
         fps_value = sp.fps if sp.fps else 24
         fps_t = torch.tensor([float(fps_value)], device=device, dtype=dtype)
-
-        _dump(dump_dir, "height.pt", height_t)
-        _dump(dump_dir, "width.pt", width_t)
-        _dump(dump_dir, "fps.pt", fps_t)
-        for k, v in extra_features.items():
-            _dump(dump_dir, f"extra_features_{k}.pt", v)
-        if uncond_extra_features is not None:
-            for k, v in uncond_extra_features.items():
-                _dump(dump_dir, f"uncond_extra_features_{k}.pt", v)
 
         has_neg = negative_prompt_embeds is not None
         in_channels = self.transformer.in_channels
@@ -819,10 +732,6 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         z = latents
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
-                _step = f"step_{i:03d}"
-                _dump(dump_dir, f"{_step}/z_input.pt", z)
-                _dump(dump_dir, f"{_step}/t.pt", t)
-
                 self._current_timestep = t
                 t_input = t.expand(1)
 
@@ -830,17 +739,10 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                 gs_i = guidance_schedule[i] if guidance_schedule is not None else guidance_scale
                 use_uncond = has_neg and ((not self.skip_uncond) or (gs_i > 1.0))
 
-                _dump(dump_dir, f"{_step}/guidance_metadata.pt", {
-                    "guidance_scale_effective": float(gs_i),
-                    "use_uncond": use_uncond,
-                    "skip_uncond": self.skip_uncond,
-                })
-
                 pred_cond = _model_forward(
                     z, t_input, prompt_embeds, vector_cond, prompt_masks,
                     ef=extra_features,
                 )
-                _dump(dump_dir, f"{_step}/pred_cond.pt", pred_cond)
 
                 if use_uncond:
                     pred_uncond = _model_forward(
@@ -848,14 +750,9 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                         negative_prompt_masks,
                         ef=_uncond_ef,
                     )
-                    _dump(dump_dir, f"{_step}/pred_uncond.pt", pred_uncond)
                     v_pred = pred_uncond + gs_i * (pred_cond - pred_uncond)
                 else:
                     v_pred = pred_cond
-
-                _dump(dump_dir, f"{_step}/v_pred_combined.pt", v_pred)
-
-                print(f'At step {i}, t: {t}, use_uncond: {use_uncond}, gs_i: {gs_i}, has_neg: {has_neg}, self.skip_uncond: {self.skip_uncond}')
 
                 # DDPM flow-matching step
                 sigma_t = (t / self.num_train_timesteps).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
@@ -875,21 +772,10 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                     mean = alpha_ts * sigma_s_div_t_sq * z + alpha_s * sigma_ts_div_t_sq * x0
                     variance = sigma_ts_div_t_sq * sigma_s ** 2
 
-                    if self.load_step_noise_dir is not None:
-                        logger.info("Loading step %d noise from %s", i, self.load_step_noise_dir)
-                        noise = torch.load(
-                            os.path.join(self.load_step_noise_dir, f"step_{i:03d}", "ddpm_noise.pt"),
-                            map_location=device, weights_only=True,
-                        ).to(dtype)
-                    else:
-                        noise = torch.randn_like(z)
-                    _dump(dump_dir, f"{_step}/ddpm_noise.pt", noise)
+                    noise = torch.randn_like(z)
                     z = mean + torch.sqrt(variance) * noise
                 else:
                     z = x0
-
-                _dump(dump_dir, f"{_step}/x0_pred.pt", x0)
-                _dump(dump_dir, f"{_step}/z_updated.pt", z)
 
                 pbar.update()
 
@@ -913,10 +799,6 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                 num_pixel_frames = (num_pixel_frames // chunk) * chunk
 
             with torch.no_grad():
-                _dump(dump_dir, "z_vae_input.pt", z)
-                _dump(dump_dir, "num_frames.pt", num_pixel_frames)
-                _dump(dump_dir, "spatial_size.pt", (height, width))
-                print(f'Decoding with num_pixel_frames: {num_pixel_frames}, spatial_size: {height, width}')
                 output = self.vae.decode(
                     z.to(dtype),
                     num_frames=num_pixel_frames,
@@ -924,8 +806,6 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                 )
             if isinstance(output, tuple):
                 output = output[0]
-            
-            print(f'Vae decoded output shape: {output[0].shape}')
         self.vae.to("cpu")
         self.transformer.to(device)
         torch.cuda.empty_cache()
