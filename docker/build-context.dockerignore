@@ -1,0 +1,56 @@
+# Applied at the build context root (parent of vllm-omni, vllm-reka, and
+# moonvalley_ai) by docker/build-serving.sh. Ignores everything at the context
+# root except those three sibling repos, then strips common junk inside them.
+
+*
+
+!vllm-omni/
+!vllm-omni/**
+!vllm-reka/
+!vllm-reka/**
+!moonvalley_ai/
+!moonvalley_ai/**
+
+# Repo hygiene
+**/.git
+**/.gitignore
+**/.gitattributes
+**/.github
+**/.dockerignore
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.tox
+**/__pycache__
+**/*.egg-info
+**/.venv
+**/venv
+**/.cache
+**/.DS_Store
+**/.idea
+**/.vscode
+**/*.pyc
+**/*.pyo
+
+# Build artifacts
+**/build
+**/dist
+**/node_modules
+
+# Model weights — do not bake into image layers
+**/*.safetensors
+**/*.ckpt
+**/*.bin
+**/*.pt
+**/*.pth
+**/*.onnx
+**/*.gguf
+
+# Large media
+**/*.mp4
+**/*.mkv
+**/*.mov
+**/*.webm
+**/*.wav
+**/*.flac
+**/*.mp3
