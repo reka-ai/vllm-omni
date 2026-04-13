@@ -268,14 +268,63 @@ def _opensora_logging_guard():
         root.setLevel(saved)
 
 
+def _resolve_moonvalley_dir() -> str:
+    """Locate the ``moonvalley_ai`` directory.
+
+    Resolution order:
+        1. ``MOONVALLEY_AI_ROOT`` environment variable.
+        2. Derived from an editable ``opensora`` install, if importable.
+        3. ``/workspace/moonvalley_ai`` (default Docker layout).
+        4. Sibling of the vllm-omni repo root (matches the README's
+           ``../moonvalley_ai`` install layout).
+        5. Inside the vllm-omni repo root (legacy editable-install layout).
+    """
+
+    def _is_valid(candidate: Path) -> bool:
+        return (candidate / "open_sora" / "opensora" / "models" / "vae").is_dir()
+
+    env_root = os.environ.get("MOONVALLEY_AI_ROOT")
+    if env_root:
+        candidate = Path(env_root).resolve()
+        if _is_valid(candidate):
+            return str(candidate)
+        raise RuntimeError(
+            f"MOONVALLEY_AI_ROOT={env_root} does not contain open_sora/opensora/models/vae"
+        )
+
+    candidates: list[Path] = []
+    try:
+        import opensora as _os_pkg  # noqa: F401 (import for path discovery)
+        candidates.append(Path(_os_pkg.__file__).resolve().parents[2])
+    except Exception:
+        pass
+
+    # pipeline_marey.py lives at <repo>/vllm_omni/diffusion/models/marey/,
+    # so parents[4] is the repo root and parents[5] is the parent of the repo.
+    repo_root = Path(__file__).resolve().parents[4]
+    candidates.extend([
+        Path("/workspace/moonvalley_ai"),
+        repo_root.parent / "moonvalley_ai",
+        repo_root / "moonvalley_ai",
+    ])
+
+    for candidate in candidates:
+        if _is_valid(candidate):
+            return str(candidate.resolve())
+
+    raise RuntimeError(
+        "Could not locate moonvalley_ai. Set MOONVALLEY_AI_ROOT to the "
+        "directory containing open_sora/opensora/models/vae, or place "
+        "moonvalley_ai alongside the vllm-omni repo."
+    )
+
+
 def _setup_opensora_imports():
     """Prepare sys.modules so opensora VAE can be imported."""
-    moonvalley_dir = os.environ.get("MOONVALLEY_AI_PATH", None)
-    moonvalley_dir = Path(moonvalley_dir).resolve()
-    assert moonvalley_dir is not None, "MOONVALLEY_AI_PATH environment variable must be set"
-    print(f'Resolved moonvalley_ai path: {moonvalley_dir}')
-    if str(moonvalley_dir) not in sys.path:
-        sys.path.insert(0, str(moonvalley_dir))
+    moonvalley_dir = _resolve_moonvalley_dir()
+    logger.info("Resolved moonvalley_ai path: %s", moonvalley_dir)
+    if moonvalley_dir not in sys.path:
+        sys.path.insert(0, moonvalley_dir)
 
     for mod_name in (
         "opensora.models",
@@ -290,7 +339,7 @@ def _setup_opensora_imports():
             stub.__package__ = mod_name
             sys.modules[mod_name] = stub
 
-    opensora_models_path = str(moonvalley_dir / "open_sora" / "opensora" / "models")
+    opensora_models_path = str(Path(moonvalley_dir) / "open_sora" / "opensora" / "models")
     sys.modules["opensora.models"].__path__ = [opensora_models_path]
 
 
