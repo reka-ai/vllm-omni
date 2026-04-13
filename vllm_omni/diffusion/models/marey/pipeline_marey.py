@@ -374,6 +374,22 @@ def _setup_opensora_imports():
     sys.modules["opensora.models"].__path__ = [opensora_models_path]
 
 
+def _prepare_opensora_logging() -> None:
+    """Normalize logging so moonvalley's get_logger() accepts this process.
+
+    OpenSora assumes Hydra has configured logging and raises if the root logger
+    is disabled or gated at ERROR+. vllm-omni workers do not run under Hydra, so
+    fix up the root logger before importing the VAE stack.
+    """
+    root_logger = logging.getLogger()
+    if root_logger.disabled:
+        root_logger.disabled = False
+    if root_logger.level >= logging.ERROR:
+        root_logger.setLevel(logging.INFO)
+    if not root_logger.handlers:
+        logging.basicConfig(level=root_logger.level)
+
+
 def _load_vae(
     vae_config: dict,
     device: torch.device,
@@ -386,14 +402,11 @@ def _load_vae(
 
     try:
         _setup_opensora_imports()
-
-        logger.info(f'Setup Opensora imports')
-        root_logger = logging.getLogger()
-        print(f'Root logger: {root_logger.handlers}')
-        print(f'Root logger level: {root_logger.level}')
+        sp_ws = 1
+        logger.info("Setup Opensora imports")
         with _opensora_logging_guard():
             from opensora.models.vae.vae_adapters import PretrainedSpatioTemporalVAETokenizer
-        logger.info(f'Import Opensora, loading VAE from {vae_path} with vae_config: {vae_config}')
+        logger.info("Import Opensora, loading VAE from %s with vae_config: %s", vae_path, vae_config)
 
         vae = PretrainedSpatioTemporalVAETokenizer(
             cp_path=vae_path,
@@ -405,7 +418,7 @@ def _load_vae(
             max_batch_size=vae_config.get("max_batch_size"),
             reuse_as_spatial_vae=vae_config.get("reuse_as_spatial_vae", False),
             extra_context_and_drop_strategy=vae_config.get("extra_context_and_drop_strategy", False),
-            enable_sequence_parallelism= False
+            enable_sequence_parallelism=sp_ws > 1,
         )
         vae = vae.to(device, dtype).eval()
         logger.info("Loaded opensora VAE (out_channels=%s, downsample=%s)", vae.out_channels, vae.downsample_factors)
