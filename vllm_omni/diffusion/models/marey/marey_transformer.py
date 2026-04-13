@@ -596,6 +596,31 @@ class MareyFluxAttention(nn.Module):
         k = norm(k)
         return k, v
 
+    @staticmethod
+    def _split_attention_outputs(
+        out: torch.Tensor,
+        y: torch.Tensor,
+        num_visual_tokens: int,
+        num_text_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        """Split attention outputs for Marey's dual-stream block.
+
+        Most backends return both image and text outputs when joint attention is
+        active, but some SP paths only materialize the queried image stream.
+        In that case, Marey should skip the text attention residual instead of
+        crashing on an invalid split.
+        """
+        total_tokens = num_visual_tokens + num_text_tokens
+        if out.shape[1] == total_tokens:
+            x_out, y_out = out.split([num_visual_tokens, num_text_tokens], dim=1)
+            return x_out, y_out, True
+        if out.shape[1] == num_visual_tokens:
+            return out, torch.zeros_like(y), False
+        raise RuntimeError(
+            "Unexpected Marey attention output length "
+            f"{out.shape[1]} for visual/text split {num_visual_tokens}/{num_text_tokens}"
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -655,9 +680,10 @@ class MareyFluxAttention(nn.Module):
         out = out.flatten(2, 3)  # [B, N_x+N_y, dim]
         out = out.type_as(x)
 
-        x_out, y_out = out.split([N_x, N_y], dim=1)
+        x_out, y_out, has_text_output = self._split_attention_outputs(out, y, N_x, N_y)
         x_out = self.proj_x(x_out)
-        y_out = proj_y(y_out)
+        if has_text_output:
+            y_out = proj_y(y_out)
         return x_out, y_out
 
 
