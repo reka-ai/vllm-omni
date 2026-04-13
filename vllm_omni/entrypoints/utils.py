@@ -206,17 +206,17 @@ def resolve_model_config_path(model: str) -> str | None:
                 if config_dict and "model_type" in config_dict:
                     model_type = config_dict["model_type"]
                 else:
-                    logger.debug(
+                    logger.warning(
                         "config.json for %s is missing 'model_type'; falling back to default stage config.", model
                     )
                     return None
             except Exception as e:
-                logger.debug(
+                logger.warning(
                     "Failed to read config.json for %s: %s; falling back to default stage config.", model, e
                 )
                 return None
         else:
-            logger.debug(
+            logger.warning(
                 "No recognised config format (transformers/diffusers/bare config.json) for %s; "
                 "falling back to default stage config.",
                 model,

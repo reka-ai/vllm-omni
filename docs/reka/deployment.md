@@ -200,7 +200,7 @@ Tag mutation is the thing that ruins reproducibility. `@sha256:` pins the exact 
 Marey's VAE loader (`vllm_omni/diffusion/models/marey/pipeline_marey.py`) imports `opensora.models.vae.vae_adapters`. `opensora` isn't pip-installable cleanly (its `__init__` pulls in heavy optional deps), so the code stubs
 parts of it at runtime and loads the VAE submodule from a sys.path entry.
 
-The image sets `MOONVALLEY_AI_ROOT=/workspace/moonvalley_ai` so the lookup succeeds.
+The image sets `MOONVALLEY_AI_PATH=/workspace/moonvalley_ai` so the lookup succeeds.
 
 **How do I build for a different GPU architecture (e.g. L40S)?**
 No change — the base image covers modern NVIDIA archs (sm_70 through sm_90).
@@ -212,4 +212,4 @@ Just deploy to a node with that GPU type.
 - `docker/build-context.dockerignore` — what gets sent to the daemon.
 - `docker/build-serving.sh` — the wrapper that enforces sibling layout.
 
-  MODEL=/app/hf_checkpoints/marey-distilled-0100 MOONVALLEY_AI_ROOT=/app/kwa/moonvalley_ai ./vllm-omni/examples/online_serving/marey/run_server.sh
+  MODEL=/app/hf_checkpoints/marey-distilled-0100 MOONVALLEY_AI_PATH=/app/kwa/moonvalley_ai ./vllm-omni/examples/online_serving/marey/run_server.sh

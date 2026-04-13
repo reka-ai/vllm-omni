@@ -39,7 +39,7 @@ def build_startup_missing_vae_error(reason: str | None) -> str:
         "Marey VAE initialization failed. "
         f"{detail} "
         "Decoded video output requires the OpenSora VAE runtime dependencies plus "
-        "a valid moonvalley_ai checkout exposed through MOONVALLEY_AI_ROOT and PYTHONPATH. "
+        "a valid moonvalley_ai checkout exposed through MOONVALLEY_AI_PATH and PYTHONPATH. "
         "If latent-only output is intentional, set "
         "model_config.allow_raw_latent_output=true, "
         "VLLM_OMNI_ALLOW_MAREY_RAW_LATENTS=1, or configure "

@@ -12,7 +12,7 @@
 #
 # Required env vars:
 #   MODEL                - Path to the Marey checkpoint directory (with config.yaml).
-#   MOONVALLEY_AI_ROOT   - Path to the moonvalley_ai checkout (containing open_sora/).
+#   MOONVALLEY_AI_PATH   - Path to the moonvalley_ai checkout (containing open_sora/).
 #                          Consumed by vllm_omni.diffusion.models.marey.pipeline_marey
 #                          to locate the opensora VAE source tree.
 #
@@ -32,7 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 : "${MODEL:?MODEL must be set to the Marey checkpoint directory}"
-: "${MOONVALLEY_AI_ROOT:?MOONVALLEY_AI_ROOT must be set to the moonvalley_ai checkout}"
+: "${MOONVALLEY_AI_PATH:?MOONVALLEY_AI_PATH must be set to the moonvalley_ai checkout}"
 
 PORT="${PORT:-8098}"
 FLOW_SHIFT="${FLOW_SHIFT:-3.0}"
@@ -40,18 +40,24 @@ ULYSSES_DEGREE="${ULYSSES_DEGREE:-8}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.98}"
 VLLM_OMNI_PROJECT="${VLLM_OMNI_PROJECT:-${REPO_ROOT}}"
 
+echo "Starting Marey server..."
 echo "Model:              $MODEL"
-echo "MoonvalleyAI root:  $MOONVALLEY_AI_ROOT"
+echo "MoonvalleyAI root:  $MOONVALLEY_AI_PATH"
 echo "Port:               $PORT"
 echo "Flow shift:         $FLOW_SHIFT"
 echo "Ulysses degree:     $ULYSSES_DEGREE"
 
 env_args=(
-    MOONVALLEY_AI_ROOT="${MOONVALLEY_AI_ROOT}"
+    MOONVALLEY_AI_PATH="${MOONVALLEY_AI_PATH}"
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 )
 [[ -n "${HF_HOME:-}" ]]                && env_args+=("HF_HOME=${HF_HOME}")
 [[ -n "${VLLM_OMNI_STORAGE_PATH:-}" ]] && env_args+=("VLLM_OMNI_STORAGE_PATH=${VLLM_OMNI_STORAGE_PATH}")
+
+# Debug / reproducibility toggles — uncomment and append to env_args to use:
+# env_args+=("MAREY_DUMP_DIR=/path/to/pipeline_dump/")
+# env_args+=("MAREY_LOAD_INITIAL_NOISE=/path/to/z_initial_noise.pt")
+# env_args+=("MAREY_LOAD_STEP_NOISE_DIR=/path/to/step_noise_dir/")
 
 env "${env_args[@]}" \
 uv run --project "${VLLM_OMNI_PROJECT}" vllm-omni serve "$MODEL" --omni \

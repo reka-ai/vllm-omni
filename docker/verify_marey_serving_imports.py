@@ -8,7 +8,7 @@ import sys
 
 
 def _main() -> int:
-    print("MOONVALLEY_AI_ROOT=", os.environ.get("MOONVALLEY_AI_ROOT", "<unset>"))
+    print("MOONVALLEY_AI_PATH=", os.environ.get("MOONVALLEY_AI_PATH", "<unset>"))
     print("PYTHONPATH=", os.environ.get("PYTHONPATH", "<unset>"))
     print("sys.path[:4]=", sys.path[:4])
 

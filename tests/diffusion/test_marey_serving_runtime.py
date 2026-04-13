@@ -26,7 +26,7 @@ def test_allow_raw_latent_output_model_config_overrides_env(monkeypatch) -> None
 def test_startup_missing_vae_error_mentions_contract() -> None:
     message = build_startup_missing_vae_error("missing dask")
     assert "missing dask" in message
-    assert "MOONVALLEY_AI_ROOT" in message
+    assert "MOONVALLEY_AI_PATH" in message
     assert "PYTHONPATH" in message
 
 

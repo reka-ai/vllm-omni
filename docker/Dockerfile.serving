@@ -41,7 +41,7 @@ RUN uv pip install --system --no-cache-dir /workspace/vllm-omni
 RUN uv pip install --system --no-cache-dir /workspace/vllm-reka
 RUN uv pip install --system --no-cache-dir -r /workspace/vllm-omni/docker/requirements-marey-serving.txt
 
-ENV MOONVALLEY_AI_ROOT=/workspace/moonvalley_ai
+ENV MOONVALLEY_AI_PATH=/workspace/moonvalley_ai
 ENV PYTHONPATH=/workspace/moonvalley_ai:/workspace/moonvalley_ai/open_sora
 
 RUN python3 /workspace/vllm-omni/docker/verify_marey_serving_imports.py

@@ -291,7 +291,7 @@ def _resolve_moonvalley_dir() -> str:
     """Locate the ``moonvalley_ai`` directory.
 
     Resolution order:
-        1. ``MOONVALLEY_AI_ROOT`` environment variable.
+        1. ``MOONVALLEY_AI_PATH`` environment variable.
         2. Derived from an editable ``opensora`` install, if importable.
         3. ``/workspace/moonvalley_ai`` (default Docker layout).
         4. Sibling of the vllm-omni repo root (matches the README's
@@ -302,13 +302,13 @@ def _resolve_moonvalley_dir() -> str:
     def _is_valid(candidate: Path) -> bool:
         return (candidate / "open_sora" / "opensora" / "models" / "vae").is_dir()
 
-    env_root = os.environ.get("MOONVALLEY_AI_ROOT")
+    env_root = os.environ.get("MOONVALLEY_AI_PATH")
     if env_root:
         candidate = Path(env_root).resolve()
         if _is_valid(candidate):
             return str(candidate)
         raise RuntimeError(
-            f"MOONVALLEY_AI_ROOT={env_root} does not contain open_sora/opensora/models/vae"
+            f"MOONVALLEY_AI_PATH={env_root} does not contain open_sora/opensora/models/vae"
         )
 
     candidates: list[Path] = []
@@ -316,8 +316,10 @@ def _resolve_moonvalley_dir() -> str:
         import opensora as _os_pkg  # noqa: F401 (import for path discovery)
         candidates.append(Path(_os_pkg.__file__).resolve().parents[2])
     except ImportError as e:
-        # opensora not installed — expected; fall through to path-based lookup.
-        logger.warning("opensora not importable (%s); falling back to path-based lookup", e)
+        # opensora is not pip-installable in our deployment; _setup_opensora_imports
+        # loads it via sys.path + stub injection. Log at DEBUG so the expected
+        # ImportError does not look like a failure.
+        logger.debug("opensora not importable (%s); falling back to path-based lookup", e)
     except Exception:
         # opensora is installed but its import raised something other than
         # ImportError (e.g. a broken transitive dep). Surface it so the
@@ -342,7 +344,7 @@ def _resolve_moonvalley_dir() -> str:
             return str(candidate.resolve())
 
     raise RuntimeError(
-        "Could not locate moonvalley_ai. Set MOONVALLEY_AI_ROOT to the "
+        "Could not locate moonvalley_ai. Set MOONVALLEY_AI_PATH to the "
         "directory containing open_sora/opensora/models/vae, or place "
         "moonvalley_ai alongside the vllm-omni repo."
     )
@@ -373,21 +375,6 @@ def _setup_opensora_imports():
     opensora_models_path = str(Path(opensora_pkg_root) / "opensora" / "models")
     sys.modules["opensora.models"].__path__ = [opensora_models_path]
 
-
-def _prepare_opensora_logging() -> None:
-    """Normalize logging so moonvalley's get_logger() accepts this process.
-
-    OpenSora assumes Hydra has configured logging and raises if the root logger
-    is disabled or gated at ERROR+. vllm-omni workers do not run under Hydra, so
-    fix up the root logger before importing the VAE stack.
-    """
-    root_logger = logging.getLogger()
-    if root_logger.disabled:
-        root_logger.disabled = False
-    if root_logger.level >= logging.ERROR:
-        root_logger.setLevel(logging.INFO)
-    if not root_logger.handlers:
-        logging.basicConfig(level=root_logger.level)
 
 
 def _load_vae(
