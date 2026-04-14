@@ -83,17 +83,11 @@ class OmniServeCommand(CLISubcommand):
         if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
             raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
 
-        # Skip validation for diffusion models as they have different requirements.
-        # Custom checkpoints (e.g. Marey) may lack model_index.json/config.json,
-        # so is_diffusion_model() returns False — fall back to treating an
-        # explicit --model-class-name that names a registered pipeline as
-        # authoritative.
-        from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
+        # Skip validation for diffusion models as they have different requirements
         from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 
         model = getattr(args, "model_tag", None) or getattr(args, "model", None)
-        model_class_name = getattr(args, "model_class_name", None)
-        if model and (is_diffusion_model(model) or model_class_name in _DIFFUSION_MODELS):
+        if model and is_diffusion_model(model):
             logger.info("Detected diffusion model: %s", model)
             return
         validate_parsed_serve_args(args)
