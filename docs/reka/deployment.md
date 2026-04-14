@@ -138,6 +138,30 @@ docker run --gpus all --rm -p 8000:8000 \
         --trust-remote-code \
         --quantization bitsandbytes
 
+# Using HF directly
+docker run --gpus all --rm -p 8000:8000 \
+    -e USE_IMAGE_PATCHING=1 \
+    -e VLLM_USE_V1=1 \
+    -e VLLM_FLASH_ATTN_VERSION=3 \
+    -e VLLM_HTTP_TIMEOUT_KEEP_ALIVE=300 \
+    -e VLLM_VIDEO_LOADER_BACKEND=yasa \
+    rekaai/vllm-omni-fork:latest \
+    vllm serve rekaai/reka-edge-2603 \
+        --served-model-name reka-edge-2603 \
+        --tokenizer-mode yasa \
+        --gpu-memory-utilization 0.95 \
+        --max-model-len 8192 \
+        --max-num-batched-tokens 20000 \
+        --limit-mm-per-prompt '{"image": 6, "video": 3}' \
+        --media-io-kwargs '{"video": {"num_frames": 6, "sampling": "chunk"}}' \
+        --tensor-parallel-size 1 \
+        --dtype bfloat16 \
+        --chat-template-content-format openai \
+        --enable-auto-tool-choice \
+        --tool-call-parser hermes \
+        --trust-remote-code \
+        --quantization bitsandbytes
+
 # In another shell — health check
 curl http://localhost:8000/health
 # → 200 OK
@@ -153,6 +177,7 @@ curl http://localhost:8000/v1/chat/completions \
 # Make sure to APPEND `:/model` to the checkpoint path - this is needed for Docker to mount
 # it to the /model inside the container, which is where vllm-omni expects it
 docker run --gpus all --rm -p 8000:8000 \
+    --shm-size=8g \
     -v /path/to/marey-distilled-0100:/model \
     -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
