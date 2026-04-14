@@ -3,3 +3,12 @@ onnxruntime>=1.23.2
 fa3-fwd==0.0.2
 # nvidia-cublas-cu12 is pinned to 12.9.1.4 via force-reinstall in Dockerfile.ci
 # because torch pins its own cublas version, making it unsatisfiable at resolve time.
+#
+# Declare torch explicitly so uv resolves the full NVIDIA runtime stack
+# (nvidia-cudnn-cu12, nvidia-cublas-cu12, etc.) via torch's PyPI wheel
+# dependencies on Linux. Transitive torch installs (via pytorch-lightning,
+# torchmetrics, etc.) sometimes drop those extras, leaving libcudnn.so.9
+# missing at import time for native `uv sync` installs. The Docker base
+# image (vllm/vllm-openai) supplies them system-wide, so the Docker build
+# path is unaffected either way.
+torch

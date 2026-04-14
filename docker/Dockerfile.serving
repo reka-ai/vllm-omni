@@ -1,0 +1,58 @@
+# Serving image for vllm-omni with bundled vllm-reka plugin and moonvalley_ai
+# source (opensora VAE). Expects the build context to be the *parent* directory
+# of the vllm-omni repo, containing:
+#
+#     <context>/vllm-omni/       — this repo
+#     <context>/vllm-reka/       — Reka Edge vLLM plugin
+#     <context>/moonvalley_ai/   — opensora source (not pip-installable)
+#
+# Build:
+#     cd <parent dir that has all three repos as siblings>
+#     docker build -f vllm-omni/docker/Dockerfile.serving \
+#         -t rekaai/vllm-omni:<tag> .
+#
+# The image supports both modes via the caller's command:
+#     vllm serve /model                                        # plain vLLM
+#     vllm serve /model --omni --stage-configs-path <yaml>     # vllm-omni
+
+ARG VLLM_BASE_IMAGE=vllm/vllm-openai
+ARG VLLM_BASE_TAG=v0.17.0
+FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG}
+
+WORKDIR /workspace
+
+# System deps needed by vllm-omni (audio/video codecs, etc.)
+RUN apt-get update && \
+    apt-get install -y espeak-ng ffmpeg git sox libsox-fmt-all jq && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy all three repos. A .dockerignore in the build context should exclude
+# .git, __pycache__, .venv, build/, dist/, *.egg-info/ etc. to keep the image
+# lean.
+COPY vllm-omni/     /workspace/vllm-omni
+COPY vllm-reka/     /workspace/vllm-reka
+COPY moonvalley_ai/ /workspace/moonvalley_ai
+
+# Install vllm-omni and the vllm-reka plugin into the base image's uv-managed
+# Python env. moonvalley_ai/open_sora is not cleanly pip-installable, so keep
+# the source in the image and expose its package root via PYTHONPATH.
+# vllm-omni uses setuptools-scm to derive its package version from git tags
+# at install time. Since .git is excluded from the build context (to keep the
+# image lean), setuptools-scm cannot find a version and the install fails.
+# Provide a dummy version via VLLM_OMNI_VERSION_OVERRIDE to skip git-based
+# versioning. Build provenance is tracked via image labels instead (see
+# build-serving.sh).
+RUN VLLM_OMNI_VERSION_OVERRIDE=0.0.0.dev0 \
+    uv pip install --system --no-cache-dir /workspace/vllm-omni
+RUN uv pip install --system --no-cache-dir /workspace/vllm-reka
+RUN uv pip install --system --no-cache-dir -r /workspace/vllm-omni/docker/requirements-marey-serving.txt
+
+ENV MOONVALLEY_AI_PATH=/workspace/moonvalley_ai
+ENV PYTHONPATH=/workspace/moonvalley_ai:/workspace/moonvalley_ai/open_sora
+
+RUN python3 /workspace/vllm-omni/docker/verify_marey_serving_imports.py
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+ENTRYPOINT []

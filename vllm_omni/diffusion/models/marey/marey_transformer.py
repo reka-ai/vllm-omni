@@ -824,7 +824,7 @@ class MareyFinalLayer(nn.Module):
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         shift, scale = self.adaLN_modulation(t).unsqueeze(1).chunk(2, dim=-1)
         x = t2i_modulate(self.norm_final(x), shift, scale)
-        x =  self.linear(x)
+        x = self.linear(x)
         # Reshape to separate T,S
         x = x.reshape(x.shape[0], x.shape[1], -1) # [B, T, S, C]
         return x

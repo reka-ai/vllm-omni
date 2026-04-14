@@ -31,6 +31,12 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.marey_serving_runtime import (
+    MareyVAEInitializationError,
+    allow_raw_latent_output,
+    build_request_missing_vae_error,
+    build_startup_missing_vae_error,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.marey.marey_transformer import MareyTransformer
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
@@ -64,10 +70,11 @@ _CHECKPOINT_KEY_REMAP = [
 def _load_yaml_config(model_path: str) -> dict:
     """Load config.yaml from model directory."""
     config_path = os.path.join(model_path, "config.yaml")
-    if os.path.exists(config_path):
+    try:
         with open(config_path) as f:
             return yaml.safe_load(f)
-    raise FileNotFoundError(f"Config file not found at {config_path}")
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Config file not found at {config_path}")
 
 
 def _deep_update(base: dict, override: dict) -> dict:
@@ -81,10 +88,23 @@ def _deep_update(base: dict, override: dict) -> dict:
 
 
 def _load_config(od_config: OmniDiffusionConfig) -> dict:
-    """Load config.yaml from od_config.model, then apply od_config.model_config overrides."""
+    """Load config.yaml from od_config.model, then apply od_config.model_config overrides.
+
+    Relative paths in the ``vae.cp_path`` field are resolved against the model
+    directory (where config.yaml lives) so a checkpoint with
+    ``cp_path: vae.ckpt`` works regardless of the process CWD or the mount
+    point (``/model``, ``/app/hf_checkpoints/…``, etc.).
+    """
     config = _load_yaml_config(od_config.model)
     if od_config.model_config:
         _deep_update(config, od_config.model_config)
+
+    vae_cfg = config.get("vae")
+    if isinstance(vae_cfg, dict):
+        cp_path = vae_cfg.get("cp_path", "")
+        if cp_path and not os.path.isabs(cp_path):
+            vae_cfg["cp_path"] = os.path.join(od_config.model, cp_path)
+
     return config
 
 
@@ -268,14 +288,77 @@ def _opensora_logging_guard():
         root.setLevel(saved)
 
 
+def _resolve_moonvalley_dir() -> str:
+    """Locate the ``moonvalley_ai`` directory.
+
+    Resolution order:
+        1. ``MOONVALLEY_AI_PATH`` environment variable.
+        2. Derived from an editable ``opensora`` install, if importable.
+        3. ``/workspace/moonvalley_ai`` (default Docker layout).
+        4. Sibling of the vllm-omni repo root (matches the README's
+           ``../moonvalley_ai`` install layout).
+        5. Inside the vllm-omni repo root (legacy editable-install layout).
+    """
+
+    def _is_valid(candidate: Path) -> bool:
+        return (candidate / "open_sora" / "opensora" / "models" / "vae").is_dir()
+
+    env_root = os.environ.get("MOONVALLEY_AI_PATH")
+    if env_root:
+        candidate = Path(env_root).resolve()
+        if _is_valid(candidate):
+            return str(candidate)
+        raise RuntimeError(
+            f"MOONVALLEY_AI_PATH={env_root} does not contain open_sora/opensora/models/vae"
+        )
+
+    candidates: list[Path] = []
+    try:
+        import opensora as _os_pkg  # noqa: F401 (import for path discovery)
+        candidates.append(Path(_os_pkg.__file__).resolve().parents[2])
+    except ImportError as e:
+        # opensora is not pip-installable in our deployment; _setup_opensora_imports
+        # loads it via sys.path + stub injection. Log at DEBUG so the expected
+        # ImportError does not look like a failure.
+        logger.debug("opensora not importable (%s); falling back to path-based lookup", e)
+    except Exception:
+        # opensora is installed but its import raised something other than
+        # ImportError (e.g. a broken transitive dep). Surface it so the
+        # failure is debuggable, then continue with the path-based fallback.
+        logger.warning(
+            "opensora is importable but raised during import; "
+            "falling back to path-based lookup",
+            exc_info=True,
+        )
+
+    # pipeline_marey.py lives at <repo>/vllm_omni/diffusion/models/marey/,
+    # so parents[4] is the repo root and parents[5] is the parent of the repo.
+    repo_root = Path(__file__).resolve().parents[4]
+    candidates.extend([
+        Path("/workspace/moonvalley_ai"),
+        repo_root.parent / "moonvalley_ai",
+        repo_root / "moonvalley_ai",
+    ])
+
+    for candidate in candidates:
+        if _is_valid(candidate):
+            return str(candidate.resolve())
+
+    raise RuntimeError(
+        "Could not locate moonvalley_ai. Set MOONVALLEY_AI_PATH to the "
+        "directory containing open_sora/opensora/models/vae, or place "
+        "moonvalley_ai alongside the vllm-omni repo."
+    )
+
+
 def _setup_opensora_imports():
     """Prepare sys.modules so opensora VAE can be imported."""
-    moonvalley_dir = os.environ.get("MOONVALLEY_AI_PATH", None)
-    moonvalley_dir = Path(moonvalley_dir).resolve()
-    assert moonvalley_dir is not None, "MOONVALLEY_AI_PATH environment variable must be set"
-    print(f'Resolved moonvalley_ai path: {moonvalley_dir}')
-    if str(moonvalley_dir) not in sys.path:
-        sys.path.insert(0, str(moonvalley_dir))
+    moonvalley_dir = _resolve_moonvalley_dir()
+    logger.info("Resolved moonvalley_ai path: %s", moonvalley_dir)
+    opensora_pkg_root = str(Path(moonvalley_dir) / "open_sora")
+    for candidate in (opensora_pkg_root, moonvalley_dir):
+        if candidate not in sys.path:
+            sys.path.insert(0, candidate)
 
     for mod_name in (
         "opensora.models",
@@ -290,27 +373,27 @@ def _setup_opensora_imports():
             stub.__package__ = mod_name
             sys.modules[mod_name] = stub
 
-    opensora_models_path = str(moonvalley_dir / "open_sora" / "opensora" / "models")
+    opensora_models_path = str(Path(opensora_pkg_root) / "opensora" / "models")
     sys.modules["opensora.models"].__path__ = [opensora_models_path]
 
 
-def _load_vae(vae_config: dict, device: torch.device, dtype: torch.dtype):
+
+def _load_vae(
+    vae_config: dict,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[nn.Module | None, str | None]:
     """Load the opensora spatiotemporal VAE from config."""
     vae_path = vae_config.get("cp_path", "")
     if not os.path.exists(vae_path):
-        logger.warning("VAE checkpoint not found at %s. VAE decoding will not be available.", vae_path)
-        return None
+        return None, f"VAE checkpoint not found at {vae_path}."
 
     try:
         _setup_opensora_imports()
-
-        logger.info(f'Setup Opensora imports')
-        root_logger = logging.getLogger()
-        print(f'Root logger: {root_logger.handlers}')
-        print(f'Root logger level: {root_logger.level}')
+        logger.info("Setup Opensora imports")
         with _opensora_logging_guard():
             from opensora.models.vae.vae_adapters import PretrainedSpatioTemporalVAETokenizer
-        logger.info(f'Import Opensora, loading VAE from {vae_path} with vae_config: {vae_config}')
+        logger.info("Import Opensora, loading VAE from %s with vae_config: %s", vae_path, vae_config)
 
         vae = PretrainedSpatioTemporalVAETokenizer(
             cp_path=vae_path,
@@ -322,14 +405,13 @@ def _load_vae(vae_config: dict, device: torch.device, dtype: torch.dtype):
             max_batch_size=vae_config.get("max_batch_size"),
             reuse_as_spatial_vae=vae_config.get("reuse_as_spatial_vae", False),
             extra_context_and_drop_strategy=vae_config.get("extra_context_and_drop_strategy", False),
-            enable_sequence_parallelism= False
+            enable_sequence_parallelism=False,
         )
         vae = vae.to(device, dtype).eval()
         logger.info("Loaded opensora VAE (out_channels=%s, downsample=%s)", vae.out_channels, vae.downsample_factors)
-        return vae
+        return vae, None
     except Exception as e:
-        logger.warning("Could not load opensora VAE (%s). Output will be raw latents.", e)
-        return None
+        return None, f"Could not load opensora VAE from {vae_path}: {type(e).__name__}: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -457,16 +539,30 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         self.byt5_max_length = te_cfg.get("byt5_max_length", 70)
 
         self.ul2_tokenizer = AutoTokenizer.from_pretrained(ul2_name)
-        self.ul2_model = T5EncoderModel.from_pretrained(ul2_name, torch_dtype=dtype).eval().to("cpu")
+        self.ul2_model = T5EncoderModel.from_pretrained(ul2_name, torch_dtype=dtype, device_map="cpu").eval()
 
         self.clip_tokenizer = CLIPTokenizer.from_pretrained(clip_name)
-        self.clip_model = CLIPTextModel.from_pretrained(clip_name, torch_dtype=dtype).eval().to("cpu")
+        self.clip_model = CLIPTextModel.from_pretrained(clip_name, torch_dtype=dtype, device_map="cpu").eval()
 
         self.byt5_tokenizer = AutoTokenizer.from_pretrained(byt5_name)
-        self.byt5_model = T5EncoderModel.from_pretrained(byt5_name, torch_dtype=dtype).eval().to("cpu")
+        self.byt5_model = T5EncoderModel.from_pretrained(byt5_name, torch_dtype=dtype, device_map="cpu").eval()
 
         # -- VAE --------------------------------------------------------------
-        self.vae = _load_vae(vae_cfg, "cpu", dtype)
+        self.allow_raw_latent_output = allow_raw_latent_output(
+            default_output_type=od_config.output_type,
+            model_config=od_config.model_config,
+        )
+        self.vae, self.vae_init_error = _load_vae(vae_cfg, "cpu", dtype)
+        if self.vae is None:
+            if self.allow_raw_latent_output:
+                logger.warning(
+                    "Marey VAE unavailable; latent-only output is enabled. %s",
+                    self.vae_init_error,
+                )
+            else:
+                raise MareyVAEInitializationError(
+                    build_startup_missing_vae_error(self.vae_init_error),
+                )
         self.vae_downsample_factors = tuple(vae_cfg.get("downsample_factors", (4, 16, 16)))
         self.vae_scale_factor_temporal = self.vae_downsample_factors[0]
         self.vae_scale_factor_spatial = self.vae_downsample_factors[1]
@@ -803,12 +899,18 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
 
         # -- VAE decode -------------------------------------------------------
         self.transformer.to("cpu")
-        self.vae.to(device)
         torch.cuda.empty_cache()
-        output_type = sp.output_type or "np"
-        if output_type == "latent" or self.vae is None:
+        output_type = sp.output_type or self.od_config.output_type or "np"
+        if self.vae is None:
+            if output_type != "latent":
+                raise MareyVAEInitializationError(
+                    build_request_missing_vae_error(self.vae_init_error, output_type),
+                )
+            output = z
+        elif output_type == "latent":
             output = z
         else:
+            self.vae.to(device)
             vae_t_ds = self.vae.downsample_factors[0]
             num_latent_t = z.shape[2]
             num_pixel_frames = num_latent_t * vae_t_ds
@@ -826,7 +928,7 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                 )
             if isinstance(output, tuple):
                 output = output[0]
-        self.vae.to("cpu")
+            self.vae.to("cpu")
         self.transformer.to(device)
         torch.cuda.empty_cache()
 
