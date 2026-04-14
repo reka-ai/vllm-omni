@@ -37,7 +37,14 @@ COPY moonvalley_ai/ /workspace/moonvalley_ai
 # Install vllm-omni and the vllm-reka plugin into the base image's uv-managed
 # Python env. moonvalley_ai/open_sora is not cleanly pip-installable, so keep
 # the source in the image and expose its package root via PYTHONPATH.
-RUN uv pip install --system --no-cache-dir /workspace/vllm-omni
+# vllm-omni uses setuptools-scm to derive its package version from git tags
+# at install time. Since .git is excluded from the build context (to keep the
+# image lean), setuptools-scm cannot find a version and the install fails.
+# Provide a dummy version via VLLM_OMNI_VERSION_OVERRIDE to skip git-based
+# versioning. Build provenance is tracked via image labels instead (see
+# build-serving.sh).
+RUN VLLM_OMNI_VERSION_OVERRIDE=0.0.0.dev0 \
+    uv pip install --system --no-cache-dir /workspace/vllm-omni
 RUN uv pip install --system --no-cache-dir /workspace/vllm-reka
 RUN uv pip install --system --no-cache-dir -r /workspace/vllm-omni/docker/requirements-marey-serving.txt
 

@@ -26,49 +26,17 @@ done
 
 # Per-repo label helpers.
 repo_sha()  { git -C "$1" rev-parse HEAD; }
-repo_head() { git -C "$1" log -1 --format='%h %ai %an: %s'; }
-repo_log()  { git -C "$1" log -n 10 --format='%h %ai %s' HEAD; }
-repo_dirty() {
-    if git -C "$1" diff-index --quiet HEAD -- 2>/dev/null; then
-        echo "false"
-    else
-        echo "true"
-    fi
-}
 
 VLLM_OMNI_SHA=$(repo_sha "$VLLM_OMNI_DIR")
 VLLM_REKA_SHA=$(repo_sha "$CONTEXT_DIR/vllm-reka")
 MOONVALLEY_SHA=$(repo_sha "$CONTEXT_DIR/moonvalley_ai")
-BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 LABELS=(
-    # OCI standard labels (reference vllm-omni as the primary repo).
-    --label "org.opencontainers.image.revision=${VLLM_OMNI_SHA}"
-    --label "org.opencontainers.image.created=${BUILD_TIME}"
-
-    # Build provenance.
-    --label "org.reka.build-time=${BUILD_TIME}"
-    --label "org.reka.build-host=$(hostname)"
-    --label "org.reka.build-user=${USER:-unknown}"
-
-    # vllm-omni
-    --label "org.reka.vllm-omni.commit-sha=${VLLM_OMNI_SHA}"
-    --label "org.reka.vllm-omni.head=$(repo_head "$VLLM_OMNI_DIR")"
-    --label "org.reka.vllm-omni.log=$(repo_log "$VLLM_OMNI_DIR")"
-    --label "org.reka.vllm-omni.dirty=$(repo_dirty "$VLLM_OMNI_DIR")"
-
-    # vllm-reka
-    --label "org.reka.vllm-reka.commit-sha=${VLLM_REKA_SHA}"
-    --label "org.reka.vllm-reka.head=$(repo_head "$CONTEXT_DIR/vllm-reka")"
-    --label "org.reka.vllm-reka.log=$(repo_log "$CONTEXT_DIR/vllm-reka")"
-    --label "org.reka.vllm-reka.dirty=$(repo_dirty "$CONTEXT_DIR/vllm-reka")"
-
-    # moonvalley_ai
-    --label "org.reka.moonvalley_ai.commit-sha=${MOONVALLEY_SHA}"
-    --label "org.reka.moonvalley_ai.head=$(repo_head "$CONTEXT_DIR/moonvalley_ai")"
-    --label "org.reka.moonvalley_ai.log=$(repo_log "$CONTEXT_DIR/moonvalley_ai")"
-    --label "org.reka.moonvalley_ai.dirty=$(repo_dirty "$CONTEXT_DIR/moonvalley_ai")"
+    --label "org.reka.vllm-omni.sha=${VLLM_OMNI_SHA}"
+    --label "org.reka.vllm-reka.sha=${VLLM_REKA_SHA}"
+    --label "org.reka.moonvalley_ai.sha=${MOONVALLEY_SHA}"
 )
 
 cd "$CONTEXT_DIR"
-exec docker build -f vllm-omni/docker/Dockerfile.serving "${LABELS[@]}" "$@" .
+exec docker build -f vllm-omni/docker/Dockerfile.serving \
+    "${LABELS[@]}" "$@" .
