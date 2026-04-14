@@ -18,7 +18,7 @@ You can launch the server through `vllm-omni serve`, you can find an example in 
 
 ```bash
 # Launch the server on a GPU node
-MODEL=/app/hf_checkpoints/marey-distilled-0100/ MOONVALLEY_AI_PATH=/home/aormazabal/wlam/wlam-inference/moonvalley_ai/ bash examples/online_serving/marey/run_server.sh
+MODEL=/app/hf_checkpoints/marey-distilled-0100/ MOONVALLEY_AI_PATH=${PATH_TO_MOONVALLEY_AI} bash examples/online_serving/marey/run_server.sh
 
 # On the same node
 SEED=0 examples/online_serving/marey/run_curl_text_to_video.sh 
@@ -30,7 +30,7 @@ Matching test command in moonvalley_ai/inference-service/marey_inference.py
 *NOTE*: Due to a bug/quirk in the way the cli params are implemented note that many flags actually disable the corresponding variable, eg --add-quality-guidance actually sets this variable to false. After talking to Igor and Adithya it seems this CLI isn’t the preferred way to launch commands on the moonvalley side so this did not interfere with their workloads. This command sets the recommended setup for marey inference that the vllm-omni implementation was designed against.
 
 ```bash
-PYTHONPATH=${PATH_TO_MOONVALLEY_AI}$ \
+PYTHONPATH=${PATH_TO_MOONVALLEY_AI} \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 uv run --project ${PATH_TO_MOONVALLEY_AI}/inference-service \
 torchrun --nproc_per_node=8 ${PATH_TO_MOONVALLEY_AI}/inference-service/marey_inference.py infer \
