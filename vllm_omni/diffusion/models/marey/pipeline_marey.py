@@ -70,10 +70,11 @@ _CHECKPOINT_KEY_REMAP = [
 def _load_yaml_config(model_path: str) -> dict:
     """Load config.yaml from model directory."""
     config_path = os.path.join(model_path, "config.yaml")
-    if os.path.exists(config_path):
+    try:
         with open(config_path) as f:
             return yaml.safe_load(f)
-    raise FileNotFoundError(f"Config file not found at {config_path}")
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Config file not found at {config_path}")
 
 
 def _deep_update(base: dict, override: dict) -> dict:
@@ -389,7 +390,6 @@ def _load_vae(
 
     try:
         _setup_opensora_imports()
-        sp_ws = 1
         logger.info("Setup Opensora imports")
         with _opensora_logging_guard():
             from opensora.models.vae.vae_adapters import PretrainedSpatioTemporalVAETokenizer
@@ -405,7 +405,7 @@ def _load_vae(
             max_batch_size=vae_config.get("max_batch_size"),
             reuse_as_spatial_vae=vae_config.get("reuse_as_spatial_vae", False),
             extra_context_and_drop_strategy=vae_config.get("extra_context_and_drop_strategy", False),
-            enable_sequence_parallelism=sp_ws > 1,
+            enable_sequence_parallelism=False,
         )
         vae = vae.to(device, dtype).eval()
         logger.info("Loaded opensora VAE (out_channels=%s, downsample=%s)", vae.out_channels, vae.downsample_factors)
@@ -539,13 +539,13 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         self.byt5_max_length = te_cfg.get("byt5_max_length", 70)
 
         self.ul2_tokenizer = AutoTokenizer.from_pretrained(ul2_name)
-        self.ul2_model = T5EncoderModel.from_pretrained(ul2_name, torch_dtype=dtype).eval().to("cpu")
+        self.ul2_model = T5EncoderModel.from_pretrained(ul2_name, torch_dtype=dtype, device_map="cpu").eval()
 
         self.clip_tokenizer = CLIPTokenizer.from_pretrained(clip_name)
-        self.clip_model = CLIPTextModel.from_pretrained(clip_name, torch_dtype=dtype).eval().to("cpu")
+        self.clip_model = CLIPTextModel.from_pretrained(clip_name, torch_dtype=dtype, device_map="cpu").eval()
 
         self.byt5_tokenizer = AutoTokenizer.from_pretrained(byt5_name)
-        self.byt5_model = T5EncoderModel.from_pretrained(byt5_name, torch_dtype=dtype).eval().to("cpu")
+        self.byt5_model = T5EncoderModel.from_pretrained(byt5_name, torch_dtype=dtype, device_map="cpu").eval()
 
         # -- VAE --------------------------------------------------------------
         self.allow_raw_latent_output = allow_raw_latent_output(

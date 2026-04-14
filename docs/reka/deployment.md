@@ -22,6 +22,17 @@ References
 
 - For production deploy: access to the infra repo (`reka-code/infra`) and `tk` CLI set up for the target cluster.
 
+### Running locally (outside Docker)
+
+If you want to run the server directly on your machine instead of via Docker, you need to install `vllm` first — it's an expected host dependency that isn't declared in this repo's own requirements.
+
+```bash
+pip install vllm==0.17.0
+pip install -e .          # then install vllm-omni
+```
+
+The Docker workflow doesn't need this because the base image (`vllm/vllm-openai:v0.17.0`) already includes vllm.
+
 ## 1. Sync the three repos
 
 On whatever machine you're building from, make sure all three sibling repos
@@ -101,23 +112,51 @@ Don't push an image you haven't run. SSH into an H100 node (or any CUDA node), p
 # On the GPU node
 docker pull rekaai/vllm-omni-fork:${VLLM_OMNI_SHA}
 
-# Plain-vLLM mode (e.g. reka-edge-2603)
+# vllm-reka mode (e.g. reka-edge-2603)
+# This exercises the vllm-reka plugin bundled in the image.
 docker run --gpus all --rm -p 8000:8000 \
-    -v /path/to/weights:/model \
-    rekaai/vllm-omni-fork:$(git rev-parse HEAD) \
-    vllm serve /model --tokenizer-mode yasa
+    -v /path/to/reka-edge-2603:/model \
+    -e USE_IMAGE_PATCHING=1 \
+    -e VLLM_USE_V1=1 \
+    -e VLLM_FLASH_ATTN_VERSION=3 \
+    -e VLLM_HTTP_TIMEOUT_KEEP_ALIVE=300 \
+    -e VLLM_VIDEO_LOADER_BACKEND=yasa \
+    rekaai/vllm-omni-fork:latest \
+    vllm serve /model \
+        --served-model-name reka-edge-2603 \
+        --tokenizer-mode yasa \
+        --gpu-memory-utilization 0.95 \
+        --max-model-len 8192 \
+        --max-num-batched-tokens 20000 \
+        --limit-mm-per-prompt '{"image": 6, "video": 3}' \
+        --media-io-kwargs '{"video": {"num_frames": 6, "sampling": "chunk"}}' \
+        --tensor-parallel-size 1 \
+        --dtype bfloat16 \
+        --chat-template-content-format openai \
+        --enable-auto-tool-choice \
+        --tool-call-parser hermes \
+        --trust-remote-code \
+        --quantization bitsandbytes
 
-# In another shell
+# In another shell — health check
 curl http://localhost:8000/health
 # → 200 OK
 
+# Send a completion request to verify the model loads and responds
+curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"reka-edge-2603","messages":[{"role":"user","content":"Hello!"}]}'
+# → should return a JSON response with a non-empty assistant message
+
 # vllm-omni diffusion mode (marey) — single-stage pipeline, not --stage-configs-path.
 # The MODEL dir must contain config.yaml, ema_inference_ckpt.safetensors, and vae.ckpt.
+# Make sure to APPEND `:/model` to the checkpoint path - this is needed for Docker to mount
+# it to the /model inside the container, which is where vllm-omni expects it
 docker run --gpus all --rm -p 8000:8000 \
     -v /path/to/marey-distilled-0100:/model \
     -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    rekaai/vllm-omni-fork:$(git rev-parse HEAD) \
+    rekaai/vllm-omni-fork:latest \
     vllm serve /model --omni \
         --port 8000 \
         --model-class-name MareyPipeline \
