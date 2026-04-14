@@ -142,6 +142,11 @@ _DIFFUSION_MODELS = {
         "pipeline_dreamid_omni",
         "DreamIDOmniPipeline",
     ),
+    "MareyPipeline": (
+        "marey",
+        "pipeline_marey",
+        "MareyPipeline",
+    ),
 }
 
 
@@ -158,6 +163,7 @@ DiffusionModelRegistry = _ModelRegistry(
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
+    "MareyPipeline",
 }
 
 
@@ -316,6 +322,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HeliosPipeline": "get_helios_post_process_func",
     "HeliosPyramidPipeline": "get_helios_post_process_func",
     "Flux2Pipeline": "get_flux2_post_process_func",
+    "MareyPipeline": "get_marey_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -332,6 +339,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",
+    "MareyPipeline": "get_marey_pre_process_func",
 }
 
 

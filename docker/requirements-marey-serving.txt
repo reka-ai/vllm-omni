@@ -1,0 +1,14 @@
+# Runtime-only dependencies needed for Marey/OpenSora VAE imports in the
+# serving image. Keep this narrower than the full moonvalley_ai training env.
+# Use lower bounds where possible so this stays additive relative to the base
+# vllm/vllm-openai image and the repo's own requirements.
+numpy>=2,<3
+pandas>=2.2.3
+pyarrow>=19.0.0
+dask[dataframe]>=2024.12.0
+decord>=0.6.0
+av>=12.0.0
+opencv-python-headless>=4.13.0
+psutil>=7.2.0
+requests>=2.32.0
+pyparsing>=3.2.0

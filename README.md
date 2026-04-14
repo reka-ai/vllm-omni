@@ -1,97 +1,64 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/logos/vllm-omni-logo.png">
-    <img alt="vllm-omni" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/logos/vllm-omni-logo.png" width=55%>
-  </picture>
-</p>
-<h3 align="center">
-Easy, fast, and cheap omni-modality model serving for everyone
-</h3>
+# vllm-omni
 
-<p align="center">
-| <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> | <a href="docs/assets/WeChat.jpg"><b>WeChat</b></a> | <a href="https://arxiv.org/abs/2602.02204"><b>Paper</b></a> | <a href="https://docs.google.com/presentation/d/1XJWgv79lORl8rbaVvp2d5Sqs6ZEBgAgj/edit?slide=id.p1#slide=id.p1"><b>Slides</b></a> |
-</p>
+## Installation
 
-
----
-
-*Latest News* 🔥
-
-- [2026/03] Check out our first public [project deepdive](https://youtu.be/sgwNfsNnR9I) at the vLLM Hong Kong Meetup!
-- [2026/03] **[vllm-omni-skills](https://github.com/hsliuustc0106/vllm-omni-skills)** is a community-driven collection of AI assistant skills that help developers work with vLLM-Omni more effectively. These skills can be used with popular agentic AI coding assistants like **Cursor IDE**, **Claude**, **Codex**, and more.
-- [2026/02] We released [0.16.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.16.0) - A major alignment + capability release that rebases onto **upstream vLLM v0.16.0** and significantly expands performance, distributed execution, and production readiness across **Qwen3-Omni / Qwen3-TTS**, **Bagel**, **MiMo-Audio**, **GLM-Image** and the **Diffusion (DiT) image/video stack**—while also improving platform coverage (CUDA / ROCm / NPU / XPU), CI quality, and documentation.
-- [2026/02] We released [0.14.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.14.0) - This is the first **stable release** of vLLM-Omni that expands Omni’s diffusion / image-video generation and audio / TTS stack, improves distributed execution and memory efficiency, and broadens platform/backend coverage (GPU/ROCm/NPU/XPU). It also brings meaningful upgrades to serving APIs, profiling & benchmarking, and overall stability. Please check our latest [paper](https://arxiv.org/abs/2602.02204) for architecture design and performance results.
-- [2026/01] We released [0.12.0rc1](https://github.com/vllm-project/vllm-omni/releases/tag/v0.12.0rc1) - a major RC milestone focused on maturing the diffusion stack, strengthening OpenAI-compatible serving, expanding omni-model coverage, and improving stability across platforms (GPU/NPU/ROCm).
-- [2025/11] vLLM community officially released [vllm-project/vllm-omni](https://github.com/vllm-project/vllm-omni) in order to support omni-modality models serving.
-
----
-
-## About
-
-[vLLM](https://github.com/vllm-project/vllm) was originally designed to support large language models for text-based autoregressive generation tasks. vLLM-Omni is a framework that extends its support for omni-modality model inference and serving:
-
-- **Omni-modality**: Text, image, video, and audio data processing
-- **Non-autoregressive Architectures**: extend the AR support of vLLM to Diffusion Transformers (DiT) and other parallel generation models
-- **Heterogeneous outputs**: from traditional text generation to multimodal outputs
-
-<p align="center">
-  <picture>
-    <img alt="vllm-omni" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/omni-modality-model-architecture.png" width=55%>
-  </picture>
-</p>
-
-vLLM-Omni is fast with:
-
-- State-of-the-art AR support by leveraging efficient KV cache management from vLLM
-- Pipelined stage execution overlapping for high throughput performance
-- Fully disaggregation based on OmniConnector and dynamic resource allocation across stages
-
-vLLM-Omni is flexible and easy to use with:
-
-- Heterogeneous pipeline abstraction to manage complex model workflows
-- Seamless integration with popular Hugging Face models
-- Tensor, pipeline, data and expert parallelism support for distributed inference
-- Streaming outputs
-- OpenAI-compatible API server
-
-vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, including:
-
-- Omni-modality models (e.g. Qwen-Omni)
-- Multi-modality generation models (e.g. Qwen-Image)
-
-## Getting Started
-
-Visit our [documentation](https://vllm-omni.readthedocs.io/en/latest/) to learn more.
-
-- [Installation](https://vllm-omni.readthedocs.io/en/latest/getting_started/installation/)
-- [Quickstart](https://vllm-omni.readthedocs.io/en/latest/getting_started/quickstart/)
-- [List of Supported Models](https://vllm-omni.readthedocs.io/en/latest/models/supported_models/)
-
-## Contributing
-
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM-Omni](https://vllm-omni.readthedocs.io/en/latest/contributing/) for how to get involved.
-
-## Citation
-
-If you use vLLM-Omni for your research, please cite our [paper](https://arxiv.org/abs/2602.02204):
-
-```bibtex
-@article{yin2026vllmomni,
-  title={vLLM-Omni: Fully Disaggregated Serving for Any-to-Any Multimodal Models},
-  author={Peiqi Yin, Jiangyun Zhu, Han Gao, Chenguang Zheng, Yongxiang Huang, Taichang Zhou, Ruirui Yang, Weizhi Liu, Weiqing Chen, Canlin Guo, Didan Deng, Zifeng Mo, Cong Wang, James Cheng, Roger Wang, Hongsheng Liu},
-  journal={arXiv preprint arXiv:2602.02204},
-  year={2026}
-}
+```bash
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install -e .
+uv pip install vllm==0.17.0 --torch-backend=auto
+# Install Open-Sora in editable mode (https://github.com/reka-ai/moonvalley_ai/tree/main/open_sora)
+# I ported this over from the original repo to avoid the dependency issues.
+uv pip install -e ../moonvalley_ai/open_sora --no-deps
 ```
 
-## Join the Community
-Feel free to ask questions, provide feedbacks and discuss with fellow users of vLLM-Omni in `#sig-omni` slack channel at [slack.vllm.ai](https://slack.vllm.ai) or vLLM user forum at [discuss.vllm.ai](https://discuss.vllm.ai).
+## Text to Video Usage with vllm-omni
 
-## Star History
+You can launch the server through `vllm-omni serve`, you can find an example in [examples/online_serving/marey/run_server.sh](examples/online_serving/marey/run_server.sh)
 
-[![Star History Chart](https://api.star-history.com/svg?repos=vllm-project/vllm-omni&type=date&legend=top-left)](https://www.star-history.com/#vllm-project/vllm-omni&type=date&legend=top-left)
+```bash
+# Launch the server on a GPU node
+MODEL=/app/hf_checkpoints/marey-distilled-0100/ MOONVALLEY_AI_PATH=${PATH_TO_MOONVALLEY_AI} bash examples/online_serving/marey/run_server.sh
 
-## License
+# On the same node
+SEED=0 examples/online_serving/marey/run_curl_text_to_video.sh 
+```
 
-Apache License 2.0, as found in the [LICENSE](./LICENSE) file.
+## Marey Inference Usage
+
+Matching test command in moonvalley_ai/inference-service/marey_inference.py
+*NOTE*: Due to a bug/quirk in the way the cli params are implemented note that many flags actually disable the corresponding variable, eg --add-quality-guidance actually sets this variable to false. After talking to Igor and Adithya it seems this CLI isn’t the preferred way to launch commands on the moonvalley side so this did not interfere with their workloads. This command sets the recommended setup for marey inference that the vllm-omni implementation was designed against.
+
+```bash
+PYTHONPATH=${PATH_TO_MOONVALLEY_AI} \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+uv run --project ${PATH_TO_MOONVALLEY_AI}/inference-service \
+torchrun --nproc_per_node=8 ${PATH_TO_MOONVALLEY_AI}/inference-service/marey_inference.py infer \
+  --num-seq-parallel-splits 8 \
+  --offload-diffusion \
+  --offload-vae \
+  --offload-text-encoder \
+  --model-folder "/app/wlam/models/checkpoints/marey/distilled-0001" \
+  --checkpoint-folder "/app/wlam/models/checkpoints/marey/distilled-0001/epoch0-global_step5000_distilled" \
+  --watermarker-path "/app/wlam/models/checkpoints/marey/videoseal/y_256b_img.jit" \
+  --height 1080 \
+  --width 1920 \
+  --num-frames 128 \
+  --fps 24 \
+  --steps 33 \
+  --guidance-scale 3.5 \
+  --disable-caching \
+  --use-negative-prompts \
+  --negative-prompt "<synthetic> <scene cut> gopro, bright, contrast, static, overexposed, bright, vignette, artifacts, still, noise, texture, scanlines, videogame, 360 camera, VR, transition, flare, saturation, distorted, warped, wide angle, contrast, saturated, vibrant, glowing, cross dissolve, texture, videogame, saturation, cheesy, ugly hands, mutated hands, mutant, disfigured, extra fingers, blown out, horrible, blurry, worst quality, bad, transition, dissolve, cross-dissolve, melt, fade in, fade out, wobbly, weird, low quality, plastic, stock footage, video camera, boring, static" \
+  --use-timestep-transform \
+  --use-distilled-steps \
+  --shift-value 3.0 \
+  --use-guidance-schedule \
+  --add-quality-guidance \
+  --clip-value 10.0 \
+  --seed 42 \
+  --warmup-steps 4 \
+  --cooldown-steps 18 \
+  --output /home/aormazabal/wlam/wlam-inference//vllm-omni/marey_inference_test_output_$(date +%Y%m%d_%H%M%S).mp4 \
+  "Detailed Description: A majestic, aged eagle with mottled golden-brown feathers soars gracefully through a vast, ancient indoor chamber. Its expansive wings barely flap, catching the air as it glides effortlessly between towering stone pillars adorned with glinting metallic accents. Beams of morning light pierce the gloom, filtering through a cracked skylight high above and illuminating swirling dust motes in their path. The camera pans smoothly, following the eagle's silent flight as it navigates the cavernous space, its sharp eyes scanning the stone floor below, creating a scene of serene power and timeless solitude. Background: The far reaches of the chamber fade into deep shadow, with the silhouettes of distant pillars barely visible. High above, a cracked skylight serves as the primary light source, its fractured glass creating distinct rays of light. Middleground: The aged eagle glides on a steady path, its mottled golden-brown wings spread wide. It passes through the dramatic beams of light, which highlight the intricate details of its feathers and the dust particles dancing in the air. Foreground: The camera looks up from a low angle, tracking the eagle's movement across the expansive stone floor, which is patterned with the bright shafts of light and deep shadows cast by the pillars."
+  ```
