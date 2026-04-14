@@ -14,28 +14,26 @@ uv pip install -e ../moonvalley_ai/open_sora --no-deps
 
 ## Text to Video Usage with vllm-omni
 
+You can launch the server through `vllm-omni serve`, you can find an example in [examples/online_serving/marey/run_server.sh](examples/online_serving/marey/run_server.sh)
+
 ```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-uv run --project /home/david/repos/vllm-omni \
-python /home/david/repos/vllm-omni/examples/offline_inference/marey/text_to_video.py \
-  --output /home/david/repos/vllm-omni/vllm_omni_output_$(date +%Y%m%d_%H%M%S).mp4 \
-  --height 1080 \
-  --width 1920 \
-  --num-frames 128 \
-  --steps 33 \
-  --guidance-scale 3.5 \
-  --prompt "Detailed Description: A majestic, aged eagle with mottled golden-brown feathers soars gracefully through a vast, ancient indoor chamber. Its expansive wings barely flap, catching the air as it glides effortlessly between towering stone pillars adorned with glinting metallic accents. Beams of morning light pierce the gloom, filtering through a cracked skylight high above and illuminating swirling dust motes in their path. The camera pans smoothly, following the eagle's silent flight as it navigates the cavernous space, its sharp eyes scanning the stone floor below, creating a scene of serene power and timeless solitude. Background: The far reaches of the chamber fade into deep shadow, with the silhouettes of distant pillars barely visible. High above, a cracked skylight serves as the primary light source, its fractured glass creating distinct rays of light. Middleground: The aged eagle glides on a steady path, its mottled golden-brown wings spread wide. It passes through the dramatic beams of light, which highlight the intricate details of its feathers and the dust particles dancing in the air. Foreground: The camera looks up from a low angle, tracking the eagle's movement across the expansive stone floor, which is patterned with the bright shafts of light and deep shadows cast by the pillars."
+# Launch the server on a GPU node
+MODEL=/app/hf_checkpoints/marey-distilled-0100/ MOONVALLEY_AI_PATH=/home/aormazabal/wlam/wlam-inference/moonvalley_ai/ bash examples/online_serving/marey/run_server.sh
+
+# On the same node
+SEED=0 examples/online_serving/marey/run_curl_text_to_video.sh 
 ```
 
 ## Marey Inference Usage
 
 Matching test command in moonvalley_ai/inference-service/marey_inference.py
+*NOTE*: Due to a bug/quirk in the way the cli params are implemented note that many flags actually disable the corresponding variable, eg --add-quality-guidance actually sets this variable to false. After talking to Igor and Adithya it seems this CLI isn’t the preferred way to launch commands on the moonvalley side so this did not interfere with their workloads. This command sets the recommended setup for marey inference that the vllm-omni implementation was designed against.
 
 ```bash
-PYTHONPATH=/home/david/repos/moonvalley_ai \
+PYTHONPATH=${PATH_TO_MOONVALLEY_AI}$ \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-uv run --project /home/david/repos/moonvalley_ai/inference-service \
-torchrun --nproc_per_node=8 /home/david/repos/moonvalley_ai/inference-service/marey_inference.py infer \
+uv run --project ${PATH_TO_MOONVALLEY_AI}/inference-service \
+torchrun --nproc_per_node=8 ${PATH_TO_MOONVALLEY_AI}/inference-service/marey_inference.py infer \
   --num-seq-parallel-splits 8 \
   --offload-diffusion \
   --offload-vae \
@@ -61,6 +59,6 @@ torchrun --nproc_per_node=8 /home/david/repos/moonvalley_ai/inference-service/ma
   --seed 42 \
   --warmup-steps 4 \
   --cooldown-steps 18 \
-  --output /home/david/repos/vllm-omni/marey_inference_test_output_$(date +%Y%m%d_%H%M%S).mp4 \
+  --output /home/aormazabal/wlam/wlam-inference//vllm-omni/marey_inference_test_output_$(date +%Y%m%d_%H%M%S).mp4 \
   "Detailed Description: A majestic, aged eagle with mottled golden-brown feathers soars gracefully through a vast, ancient indoor chamber. Its expansive wings barely flap, catching the air as it glides effortlessly between towering stone pillars adorned with glinting metallic accents. Beams of morning light pierce the gloom, filtering through a cracked skylight high above and illuminating swirling dust motes in their path. The camera pans smoothly, following the eagle's silent flight as it navigates the cavernous space, its sharp eyes scanning the stone floor below, creating a scene of serene power and timeless solitude. Background: The far reaches of the chamber fade into deep shadow, with the silhouettes of distant pillars barely visible. High above, a cracked skylight serves as the primary light source, its fractured glass creating distinct rays of light. Middleground: The aged eagle glides on a steady path, its mottled golden-brown wings spread wide. It passes through the dramatic beams of light, which highlight the intricate details of its feathers and the dust particles dancing in the air. Foreground: The camera looks up from a low angle, tracking the eagle's movement across the expansive stone floor, which is patterned with the bright shafts of light and deep shadows cast by the pillars."
   ```
