@@ -18,7 +18,11 @@ You can launch the server through `vllm-omni serve`, you can find an example in 
 
 ```bash
 # Launch the server on a GPU node
-HF_HOME=/mnt/localdisk/vllm_omni_hf_cache/ MODEL=/app/hf_checkpoints/marey-distilled-0100/ MOONVALLEY_AI_PATH=${PATH_TO_MOONVALLEY_AI} bash examples/online_serving/marey/run_server.sh
+HF_HOME=/mnt/localdisk/vllm_omni_hf_cache/ \
+VLLM_OMNI_STORAGE_PATH=/mnt/localdisk/vllm_omni_storage \
+MODEL=/app/hf_checkpoints/marey-distilled-0100/ \
+MOONVALLEY_AI_PATH=${PATH_TO_MOONVALLEY_AI} \
+bash examples/online_serving/marey/run_server.sh
 
 # On the same node
 SEED=0 examples/online_serving/marey/run_curl_text_to_video.sh 
