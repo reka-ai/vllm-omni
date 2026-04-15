@@ -18,12 +18,13 @@ You can launch the server through `vllm-omni serve`, you can find an example in 
 
 ```bash
 # Launch the server on a GPU node
-MODEL=/app/hf_checkpoints/marey-distilled-0100/ MOONVALLEY_AI_PATH=${PATH_TO_MOONVALLEY_AI} bash examples/online_serving/marey/run_server.sh
+HF_HOME=/mnt/localdisk/vllm_omni_hf_cache/ MODEL=/app/hf_checkpoints/marey-distilled-0100/ MOONVALLEY_AI_PATH=${PATH_TO_MOONVALLEY_AI} bash examples/online_serving/marey/run_server.sh
 
 # On the same node
 SEED=0 examples/online_serving/marey/run_curl_text_to_video.sh 
 ```
 
+*NOTE*: For some reason simultaneous loading of HF models from multiple ranks can cause issues when loading from the shared filesystem, if you run into errors like  `OSError: google/ul2 does not appear to have a file named pytorch_model-00001-of-00004.bin.`, set `HF_HOME` to a node-local path as in the example above.
 ## Marey Inference Usage
 
 Matching test command in moonvalley_ai/inference-service/marey_inference.py
