@@ -530,22 +530,45 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
             ),
         ]
 
-        # -- Text encoders (UL2, CLIP, ByT5) ---------------------------------
+        # -- Text encoders ----------------------------------------------------
         ul2_name = te_cfg.get("ul2_pretrained", "google/ul2")
-        clip_name = te_cfg.get("clip_pretrained", "laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90K")
-        byt5_name = te_cfg.get("byt5_pretrained", "google/byt5-large")
         self.ul2_max_length = te_cfg.get("ul2_max_length", 300)
-        self.clip_max_length = te_cfg.get("clip_max_length", 77)
-        self.byt5_max_length = te_cfg.get("byt5_max_length", 70)
 
         self.ul2_tokenizer = AutoTokenizer.from_pretrained(ul2_name)
         self.ul2_model = T5EncoderModel.from_pretrained(ul2_name, torch_dtype=dtype, device_map="cpu").eval()
 
-        self.clip_tokenizer = CLIPTokenizer.from_pretrained(clip_name)
-        self.clip_model = CLIPTextModel.from_pretrained(clip_name, torch_dtype=dtype, device_map="cpu").eval()
-
-        self.byt5_tokenizer = AutoTokenizer.from_pretrained(byt5_name)
-        self.byt5_model = T5EncoderModel.from_pretrained(byt5_name, torch_dtype=dtype, device_map="cpu").eval()
+        # Second text encoder: MetaCLIP-sequence or CLIP-vector + ByT5
+        metaclip_name = te_cfg.get("metaclip_pretrained")
+        if metaclip_name:
+            # ul2-metaclip: MetaCLIP provides sequence features (last_hidden_state)
+            self._metaclip_as_seq = True
+            self.clip_max_length = te_cfg.get("metaclip_max_length", 77)
+            self.byt5_max_length = te_cfg.get("byt5_max_length", self.clip_max_length)
+            self.clip_tokenizer = CLIPTokenizer.from_pretrained(metaclip_name)
+            self.clip_model = CLIPTextModel.from_pretrained(
+                metaclip_name, torch_dtype=dtype, device_map="cpu").eval()
+            # Alias MetaCLIP into the byt5 slot for reuse in encode_prompt
+            self.byt5_tokenizer = self.clip_tokenizer
+            self.byt5_model = self.clip_model
+            caption_channels = [self.ul2_model.config.d_model,
+                                self.clip_model.config.hidden_size]
+            vector_cond_channels = None
+        else:
+            # ul2-clip-quote (30B): CLIP pooled vector + ByT5 sequence
+            self._metaclip_as_seq = False
+            clip_name = te_cfg.get("clip_pretrained", "laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90K")
+            byt5_name = te_cfg.get("byt5_pretrained", "google/byt5-large")
+            self.clip_max_length = te_cfg.get("clip_max_length", 77)
+            self.byt5_max_length = te_cfg.get("byt5_max_length", 70)
+            self.clip_tokenizer = CLIPTokenizer.from_pretrained(clip_name)
+            self.clip_model = CLIPTextModel.from_pretrained(
+                clip_name, torch_dtype=dtype, device_map="cpu").eval()
+            self.byt5_tokenizer = AutoTokenizer.from_pretrained(byt5_name)
+            self.byt5_model = T5EncoderModel.from_pretrained(
+                byt5_name, torch_dtype=dtype, device_map="cpu").eval()
+            caption_channels = [self.ul2_model.config.d_model,
+                                self.byt5_model.config.d_model]
+            vector_cond_channels = self.clip_model.config.hidden_size
 
         # -- VAE --------------------------------------------------------------
         self.allow_raw_latent_output = allow_raw_latent_output(
@@ -569,9 +592,6 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
 
         # -- Transformer ------------------------------------------------------
         in_channels = len(vae_cfg.get("scaling_factor", [0] * 16))
-        # Caption channels: UL2 hidden dim, ByT5 hidden dim
-        caption_channels = [self.ul2_model.config.d_model, self.byt5_model.config.d_model]
-        vector_cond_channels = self.clip_model.config.hidden_size
         self.transformer = _create_transformer_from_config(
             model_cfg, te_cfg, in_channels, caption_channels, vector_cond_channels,
         )
@@ -581,6 +601,9 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         self.sched_tmin = sched_cfg.get("tmin", 0.001)
         self.sched_tmax = sched_cfg.get("tmax", 1.0)
         self.sched_teacher_steps = sched_cfg.get("num_sampling_steps", 100)
+        # flow_shift comes from the CLI (--flow-shift). `0.0` means "skip the
+        # timestep transform" (see `shift=... if > 0 else None` below); pass
+        # `3.0` for 30B (distilled, transform on) and `0.0` for 7B
         self.flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 3.0
 
         # -- Guidance defaults ------------------------------------------------
@@ -654,10 +677,13 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
             clip_output = self.clip_model(input_ids=clip_inputs["input_ids"].to(device))
             vector_cond = clip_output.pooler_output.to(dtype)
 
-        # ByT5
-        quote_text = quote_override if quote_override is not None else _extract_quotes(prompt)
+        # ByT5 / MetaCLIP-sequence
+        if self._metaclip_as_seq:
+            seq2_text = prompt
+        else:
+            seq2_text = quote_override if quote_override is not None else _extract_quotes(prompt)
         byt5_inputs = self.byt5_tokenizer(
-            quote_text,
+            seq2_text,
             padding="max_length",
             max_length=self.byt5_max_length,
             truncation=True,
