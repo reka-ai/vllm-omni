@@ -1,0 +1,154 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Marey VAE decoding stage.
+
+Stage 2 of the staged Marey pipeline. Consumes the denoised latent tensor
+produced by the DiT stage (delivered via ``req.prompts[0][
+"additional_information"]["latents"]``) and returns the decoded video.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from collections.abc import Iterable
+
+import torch
+import yaml
+from torch import nn
+
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.models.marey.vae_loader import load_vae
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+logger = logging.getLogger(__name__)
+
+
+def _load_yaml_config(model_path: str) -> dict:
+    config_path = os.path.join(model_path, "config.yaml")
+    try:
+        with open(config_path) as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Config file not found at {config_path}")
+
+
+def _resolve_vae_config(od_config: OmniDiffusionConfig) -> dict:
+    config = _load_yaml_config(od_config.model)
+    vae_cfg = config.get("vae", {}) or {}
+    cp_path = vae_cfg.get("cp_path", "")
+    if cp_path and not os.path.isabs(cp_path):
+        vae_cfg["cp_path"] = os.path.join(od_config.model, cp_path)
+    if od_config.model_config and "vae" in od_config.model_config:
+        vae_cfg.update(od_config.model_config["vae"])
+    return vae_cfg
+
+
+def get_marey_vae_post_process_func(od_config: OmniDiffusionConfig):
+    """Video post-processing: decoded frames → numpy/tensor/etc."""
+    from diffusers.video_processor import VideoProcessor
+
+    video_processor = VideoProcessor(vae_scale_factor=8)
+
+    def post_process_func(video: torch.Tensor, output_type: str = "np"):
+        if output_type == "latent":
+            return video
+        return video_processor.postprocess_video(video, output_type=output_type)
+
+    return post_process_func
+
+
+class MareyVaePipeline(nn.Module):
+    """Stage-2 Marey VAE decoder pipeline."""
+
+    def __init__(
+        self,
+        *,
+        od_config: OmniDiffusionConfig,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.od_config = od_config
+        self.device = get_local_device()
+        self.dtype = getattr(od_config, "dtype", torch.bfloat16)
+
+        vae_cfg = _resolve_vae_config(od_config)
+        # Load on CPU first; we move to GPU per-forward to stay consistent
+        # with the rest of vllm-omni's diffusion stages (which own their GPU
+        # memory for the duration of a request).
+        self.vae, self.vae_init_error = load_vae(vae_cfg, "cpu", self.dtype)
+        if self.vae is None:
+            raise RuntimeError(f"MareyVaePipeline failed to load VAE: {self.vae_init_error}")
+
+        ds = tuple(vae_cfg.get("downsample_factors", (4, 16, 16)))
+        self.vae_scale_factor_temporal = ds[0]
+        self.vae_scale_factor_spatial = ds[1]
+
+    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        if len(req.prompts) != 1:
+            raise ValueError("MareyVaePipeline only supports a single prompt per request.")
+
+        raw_prompt = req.prompts[0]
+        if isinstance(raw_prompt, str):
+            raise ValueError(
+                "MareyVaePipeline expects a dict prompt carrying latents in "
+                "additional_information['latents']; got a raw string."
+            )
+        add_info = raw_prompt.get("additional_information") or {}
+
+        z = add_info.get("latents")
+        if z is None:
+            # Fallback: the stage input processor may have stashed the latent
+            # on sampling_params.latents instead.
+            z = req.sampling_params.latents
+        if z is None:
+            raise ValueError(
+                "MareyVaePipeline requires 'latents' in additional_information "
+                "(populated by stage_input_processors.marey.diffusion2vae)."
+            )
+
+        z = z.to(device=self.device, dtype=self.dtype)
+
+        height = add_info.get("height") or req.sampling_params.height or 720
+        width = add_info.get("width") or req.sampling_params.width or 1280
+        num_frames_req = add_info.get("num_frames") or req.sampling_params.num_frames or 33
+
+        sp = req.sampling_params
+        output_type = sp.output_type or self.od_config.output_type or "np"
+        if output_type == "latent":
+            return DiffusionOutput(output=z)
+
+        self.vae.to(self.device)
+        try:
+            vae_t_ds = self.vae.downsample_factors[0]
+            num_latent_t = z.shape[2]
+            num_pixel_frames = num_latent_t * vae_t_ds
+            chunk = self.vae.frame_chunk_len
+            if num_latent_t <= 1:
+                num_pixel_frames = 1
+            elif chunk is not None and num_pixel_frames % chunk != 0:
+                num_pixel_frames = (num_pixel_frames // chunk) * chunk
+
+            with torch.no_grad():
+                output = self.vae.decode(
+                    z,
+                    num_frames=num_pixel_frames,
+                    spatial_size=(int(height), int(width)),
+                )
+            if isinstance(output, tuple):
+                output = output[0]
+        finally:
+            self.vae.to("cpu")
+            torch.cuda.empty_cache()
+
+        return DiffusionOutput(output=output)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # VAE weights are loaded inside load_vae() via the opensora
+        # PretrainedSpatioTemporalVAETokenizer. The ``weights`` iterator is
+        # irrelevant here — return all parameter names so the framework
+        # considers the load successful.
+        _ = list(weights)
+        return {name for name, _ in self.named_parameters()}

@@ -174,6 +174,11 @@ _OMNI_MODELS = {
         "dynin_omni",
         "DyninOmniForConditionalGeneration",
     ),
+    "MareyTextEncoder": (
+        "marey",
+        "marey_text_encoder",
+        "MareyTextEncoder",
+    ),
 }
 
 

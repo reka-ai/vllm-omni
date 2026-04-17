@@ -188,6 +188,16 @@ _DIFFUSION_MODELS = {
         "pipeline_omnivoice",
         "OmniVoicePipeline",
     ),
+    "MareyDitPipeline": (
+        "marey",
+        "pipeline_marey",
+        "MareyDitPipeline",
+    ),
+    "MareyVaePipeline": (
+        "marey",
+        "pipeline_marey_vae",
+        "MareyVaePipeline",
+    ),
 }
 
 
@@ -376,6 +386,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
+    "MareyDitPipeline": "get_marey_post_process_func",
+    "MareyVaePipeline": "get_marey_vae_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
