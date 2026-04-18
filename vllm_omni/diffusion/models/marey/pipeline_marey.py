@@ -233,20 +233,20 @@ def _build_guidance_schedule(
 
 
 # ---------------------------------------------------------------------------
-# Post-process (shared with VAE stage via registry mapping)
+# Post-process (DiT stage — passthrough; VAE stage handles frame post-proc)
 # ---------------------------------------------------------------------------
 
 
 def get_marey_post_process_func(od_config: OmniDiffusionConfig):
-    """Return a function that converts decoded frames to the requested output type."""
-    from diffusers.video_processor import VideoProcessor
+    """DiT-stage post-process is a passthrough.
 
-    video_processor = VideoProcessor(vae_scale_factor=8)
+    Stage 1's output is the final denoised latent tensor, which is consumed
+    by stage 2 (VAE). Applying the video processor here would treat the
+    latent as pixel frames and corrupt it.
+    """
 
-    def post_process_func(video: torch.Tensor, output_type: str = "np"):
-        if output_type == "latent":
-            return video
-        return video_processor.postprocess_video(video, output_type=output_type)
+    def post_process_func(latent: torch.Tensor, output_type: str = "latent"):
+        return latent
 
     return post_process_func
 
@@ -565,11 +565,16 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
 
         self._current_timestep = None
 
-        # Stage output: final latents. The orchestrator forwards these to the
-        # VAE stage via stage_input_processors.marey.diffusion2vae.
+        # Stage output: final latents. The diffusion engine stores
+        # ``DiffusionOutput.output`` on the downstream ``OmniRequestOutput``
+        # as ``.images``, but ``.latents`` stays unset. Stash the latent
+        # in ``custom_output`` so ``stage_input_processors.marey.diffusion2vae``
+        # reads it from ``source_output._custom_output`` with the other
+        # size metadata.
         return DiffusionOutput(
             output=z,
             custom_output={
+                "latents": z,
                 "height": height,
                 "width": width,
                 "num_frames": num_frames,

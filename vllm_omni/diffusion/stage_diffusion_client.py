@@ -130,6 +130,11 @@ class StageDiffusionClient:
         self._tasks: dict[str, asyncio.Task] = {}
         self._shutting_down = False
 
+        # Populated by the orchestrator's ``set_engine_outputs`` when this
+        # stage feeds a downstream diffusion stage (e.g. Marey DiT → VAE).
+        # Read by ``stage_input_processors`` via ``stage_list[id].engine_outputs``.
+        self.engine_outputs: Any = None
+
         logger.info(
             "[StageDiffusionClient] Stage-%s initialized (owns_process=%s, batch_size=%d)",
             self.stage_id,
@@ -234,6 +239,16 @@ class StageDiffusionClient:
     # ------------------------------------------------------------------
     # Public API (matches the interface the Orchestrator expects)
     # ------------------------------------------------------------------
+
+    def set_engine_outputs(self, engine_outputs: Any) -> None:
+        """Stash outputs so the next stage's input processor can read them.
+
+        Mirrors the method of the same name on ``StageEngineCoreClient`` —
+        needed when a diffusion stage feeds another diffusion stage (e.g.
+        Marey DiT → VAE). The orchestrator calls this before building the
+        downstream stage's input.
+        """
+        self.engine_outputs = engine_outputs
 
     async def add_request_async(
         self,

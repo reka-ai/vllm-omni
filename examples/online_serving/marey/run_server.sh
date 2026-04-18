@@ -51,6 +51,7 @@ echo "VLLM Omni project:  $VLLM_OMNI_PROJECT"
 env_args=(
     MOONVALLEY_AI_PATH="${MOONVALLEY_AI_PATH}"
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    VLLM_OMNI_PROJECT="${VLLM_OMNI_PROJECT}"
 )
 [[ -n "${HF_HOME:-}" ]]                && env_args+=("HF_HOME=${HF_HOME}")
 [[ -n "${VLLM_OMNI_STORAGE_PATH:-}" ]] && env_args+=("VLLM_OMNI_STORAGE_PATH=${VLLM_OMNI_STORAGE_PATH}")

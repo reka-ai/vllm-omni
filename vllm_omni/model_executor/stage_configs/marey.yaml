@@ -19,8 +19,23 @@ stage_args:
     engine_args:
       model_stage: text_encoder
       model_arch: MareyTextEncoder
+      # The Marey checkpoint dir has no HF config.json / tokenizer. Borrow
+      # google/ul2's config (it's cached already for the Marey text encoder
+      # bundle) so vLLM's Transformers-backed ModelConfig validation passes
+      # with a recognized `model_type`. `hf_overrides.architectures` below
+      # then routes instantiation to MareyTextEncoder. The token IDs that
+      # vLLM tokenizes are ignored — MareyTextEncoder overrides
+      # `embed_input_ids` and runs its own UL2+CLIP+ByT5 bundle from the
+      # prompt text forwarded through `runtime_additional_information`.
+      hf_config_path: google/ul2
+      tokenizer: google/ul2
       hf_overrides:
         architectures: [MareyTextEncoder]
+        # UL2 is encoder-decoder; override so vLLM treats this as a plain
+        # decoder-only stage (MareyTextEncoder does its own encoding and
+        # does not use vLLM's cross-attention / multimodal budget).
+        is_encoder_decoder: false
+        model_type: gpt2
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       engine_output_type: latent
@@ -30,8 +45,10 @@ stage_args:
       enable_prefix_caching: false
       tensor_parallel_size: 1
       gpu_memory_utilization: 0.15
+      # Must stay ≤ google/ul2's n_positions (512). vLLM's tokenization
+      # path is irrelevant here — MareyTextEncoder ignores the token IDs.
       max_num_batched_tokens: 512
-      max_model_len: 1024
+      max_model_len: 512
     is_comprehension: true
     final_output: false
     default_sampling_params:

@@ -9,7 +9,7 @@ set -euo pipefail
 BASE_URL="${BASE_URL:-http://localhost:8098}"
 POLL_INTERVAL="${POLL_INTERVAL:-5}"
 SEED="${SEED:-0}"
-OUTPUT_PATH="${OUTPUT_PATH:-marey_output_noquality_seed${SEED}.mp4}"
+OUTPUT_PATH="${OUTPUT_PATH:-marey_stages_${SEED}.mp4}"
 create_response=$(
   curl -sS -X POST "${BASE_URL}/v1/videos" \
     -H "Accept: application/json" \

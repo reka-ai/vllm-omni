@@ -320,9 +320,25 @@ class OmniOpenAIServingVideo:
                 detail="Video generation requires the final stage to be a diffusion stage.",
             )
 
-        # Common generation logic for both paths
+        # Common generation logic for both paths. Build a per-stage
+        # sampling-params list: diffusion stages get the user-supplied
+        # gen_params; llm stages get whatever default the YAML declared
+        # (vLLM's input processor rejects OmniDiffusionSamplingParams for
+        # llm stages).
         engine_client = cast(AsyncOmni, self._engine_client)
-        sampling_params_list: list[OmniSamplingParams] = [gen_params for _ in stage_configs]
+        defaults = getattr(engine_client, "default_sampling_params_list", None) or []
+        sampling_params_list: list[OmniSamplingParams] = []
+        for idx, stage in enumerate(stage_configs):
+            if get_stage_type(stage) == "diffusion":
+                sampling_params_list.append(gen_params)
+            else:
+                default = defaults[idx] if idx < len(defaults) else None
+                if default is None:
+                    raise HTTPException(
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                        detail=f"Stage {idx}: no default sampling params available for llm stage.",
+                    )
+                sampling_params_list.append(default)
 
         result = None
         async for output in engine_client.generate(

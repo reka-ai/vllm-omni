@@ -62,7 +62,23 @@ class MareyTextEncoder(nn.Module):
     has_preprocess = False
     has_postprocess = False
 
-    _MM_KEY = "marey_text_encoder_out"
+    # Per-request keys emitted in OmniOutput.multimodal_outputs. The
+    # diffusion worker's multimodal output handler expects each dict value
+    # to be a plain Tensor (or list[Tensor] with len == num_reqs), not
+    # nested dicts — so we flatten the encoder result into one key per
+    # tensor and let the stage input processor reassemble them.
+    _MM_KEYS = (
+        "prompt_embeds_ul2",
+        "prompt_embeds_byt5",
+        "prompt_masks_ul2",
+        "prompt_masks_byt5",
+        "vector_cond",
+        "neg_prompt_embeds_ul2",
+        "neg_prompt_embeds_byt5",
+        "neg_prompt_masks_ul2",
+        "neg_prompt_masks_byt5",
+        "neg_vector_cond",
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -127,58 +143,77 @@ class MareyTextEncoder(nn.Module):
         if not additional_infos:
             additional_infos = [{}]
 
-        results: list[dict[str, Any]] = []
+        # One list per key, filled positionally per request. The diffusion
+        # worker expects multimodal_outputs[key] to be a Tensor or
+        # list[Tensor] with len == num_reqs.
+        by_key: dict[str, list[torch.Tensor]] = {k: [] for k in self._MM_KEYS}
+
         for info in additional_infos:
             prompt_text = info.get("prompt_text") or info.get("prompt") or ""
             neg_text = info.get("negative_prompt_text") or info.get("negative_prompt")
-            guidance_scale = info.get("guidance_scale")
 
+            # vLLM's profile / dummy-forward path calls us with an empty
+            # runtime_additional_information entry. Emit zero placeholders
+            # sized from the encoder configs — the worker only requires a
+            # Tensor per key per request, and the downstream stage input
+            # processor skips unfinished/dummy requests anyway.
             if not isinstance(prompt_text, str) or not prompt_text:
-                raise ValueError(
-                    "MareyTextEncoder requires a non-empty 'prompt_text' in "
-                    "runtime_additional_information for each request."
-                )
+                self._append_dummy(by_key, device)
+                continue
 
             # Reference Marey passes quote_override="" during inference so
             # ByT5 encodes an empty string when no quotes are detected.
             pos_embeds, pos_masks, pos_vec = bundle.encode_prompt(
                 prompt_text, device=device, dtype=self.dtype, quote_override="",
             )
+            # Always encode negative too; stage 1 decides whether to apply
+            # CFG based on its own guidance_scale (avoids optional tensors
+            # in the multimodal_outputs contract).
+            neg_prompt = neg_text if (isinstance(neg_text, str) and neg_text) else DEFAULT_NEGATIVE_PROMPT
+            neg_embeds, neg_masks, neg_vec = bundle.encode_prompt(
+                neg_prompt, device=device, dtype=self.dtype, quote_override="",
+            )
 
-            use_cfg = False
-            if guidance_scale is not None:
-                try:
-                    use_cfg = float(guidance_scale) > 1.0
-                except Exception:
-                    use_cfg = False
-            if not use_cfg and neg_text is not None:
-                # If a negative prompt was explicitly provided, always encode
-                # it — the downstream DiT stage decides whether to apply CFG
-                # based on its own guidance_scale logic.
-                use_cfg = True
-
-            neg_embeds = neg_masks = neg_vec = None
-            if use_cfg:
-                neg_prompt = neg_text if (isinstance(neg_text, str) and neg_text) else DEFAULT_NEGATIVE_PROMPT
-                neg_embeds, neg_masks, neg_vec = bundle.encode_prompt(
-                    neg_prompt, device=device, dtype=self.dtype, quote_override="",
-                )
-
-            results.append({
-                "prompt_embeds":     [t.cpu() for t in pos_embeds],
-                "prompt_masks":      [t.cpu() for t in pos_masks],
-                "vector_cond":       pos_vec.cpu(),
-                "neg_prompt_embeds": [t.cpu() for t in neg_embeds] if neg_embeds is not None else None,
-                "neg_prompt_masks":  [t.cpu() for t in neg_masks] if neg_masks is not None else None,
-                "neg_vector_cond":   neg_vec.cpu() if neg_vec is not None else None,
-            })
+            by_key["prompt_embeds_ul2"].append(pos_embeds[0].cpu().contiguous())
+            by_key["prompt_embeds_byt5"].append(pos_embeds[1].cpu().contiguous())
+            by_key["prompt_masks_ul2"].append(pos_masks[0].cpu().contiguous())
+            by_key["prompt_masks_byt5"].append(pos_masks[1].cpu().contiguous())
+            by_key["vector_cond"].append(pos_vec.cpu().contiguous())
+            by_key["neg_prompt_embeds_ul2"].append(neg_embeds[0].cpu().contiguous())
+            by_key["neg_prompt_embeds_byt5"].append(neg_embeds[1].cpu().contiguous())
+            by_key["neg_prompt_masks_ul2"].append(neg_masks[0].cpu().contiguous())
+            by_key["neg_prompt_masks_byt5"].append(neg_masks[1].cpu().contiguous())
+            by_key["neg_vector_cond"].append(neg_vec.cpu().contiguous())
 
         # ``multimodal_outputs`` is a dict of per-request lists; downstream
         # output processing iterates positionally across requests.
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={self._MM_KEY: results},
+            multimodal_outputs=by_key,
         )
+
+    def _append_dummy(self, by_key: dict[str, list[torch.Tensor]], device: torch.device) -> None:
+        """Append zero-shaped placeholder tensors for a dummy/profile request."""
+        cfg = self.te_cfg
+        ul2_dim = 4096  # Matches google/ul2 d_model; exact value is irrelevant for dummy.
+        byt5_dim = 1536
+        clip_dim = 768
+        dt = self.dtype
+        zeros_ul2 = torch.zeros((1, cfg.ul2_max_length, ul2_dim), device=device, dtype=dt).cpu().contiguous()
+        zeros_byt5 = torch.zeros((1, cfg.byt5_max_length, byt5_dim), device=device, dtype=dt).cpu().contiguous()
+        ones_ul2_mask = torch.ones((1, cfg.ul2_max_length), device=device, dtype=torch.bool).cpu().contiguous()
+        ones_byt5_mask = torch.ones((1, cfg.byt5_max_length), device=device, dtype=torch.bool).cpu().contiguous()
+        zeros_clip = torch.zeros((1, clip_dim), device=device, dtype=dt).cpu().contiguous()
+        by_key["prompt_embeds_ul2"].append(zeros_ul2)
+        by_key["prompt_embeds_byt5"].append(zeros_byt5)
+        by_key["prompt_masks_ul2"].append(ones_ul2_mask)
+        by_key["prompt_masks_byt5"].append(ones_byt5_mask)
+        by_key["vector_cond"].append(zeros_clip)
+        by_key["neg_prompt_embeds_ul2"].append(zeros_ul2.clone())
+        by_key["neg_prompt_embeds_byt5"].append(zeros_byt5.clone())
+        by_key["neg_prompt_masks_ul2"].append(ones_ul2_mask.clone())
+        by_key["neg_prompt_masks_byt5"].append(ones_byt5_mask.clone())
+        by_key["neg_vector_cond"].append(zeros_clip.clone())
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
