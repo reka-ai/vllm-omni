@@ -86,6 +86,15 @@ class MareyVaePipeline(nn.Module):
         self.vae_scale_factor_temporal = ds[0]
         self.vae_scale_factor_spatial = ds[1]
 
+    def _dummy_latent(self, height: int, width: int, num_frames: int) -> torch.Tensor:
+        t_ds = self.vae_scale_factor_temporal
+        s_ds = self.vae_scale_factor_spatial
+        channels = int(getattr(self.vae, "out_channels", 16))
+        lat_t = max(1, (num_frames + t_ds - 1) // t_ds)
+        lat_h = max(1, (height + s_ds - 1) // s_ds)
+        lat_w = max(1, (width + s_ds - 1) // s_ds)
+        return torch.zeros((1, channels, lat_t, lat_h, lat_w), device=self.device, dtype=self.dtype)
+
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         if len(req.prompts) != 1:
             raise ValueError("MareyVaePipeline only supports a single prompt per request.")
@@ -103,17 +112,19 @@ class MareyVaePipeline(nn.Module):
             # Fallback: the stage input processor may have stashed the latent
             # on sampling_params.latents instead.
             z = req.sampling_params.latents
-        if z is None:
-            raise ValueError(
-                "MareyVaePipeline requires 'latents' in additional_information "
-                "(populated by stage_input_processors.marey.diffusion2vae)."
-            )
-
-        z = z.to(device=self.device, dtype=self.dtype)
 
         height = add_info.get("height") or req.sampling_params.height or 720
         width = add_info.get("width") or req.sampling_params.width or 1280
         num_frames_req = add_info.get("num_frames") or req.sampling_params.num_frames or 33
+
+        if z is None:
+            # Warmup / dummy run: the diffusion engine's _dummy_run sends an
+            # OmniTextPrompt with no additional_information. Fabricate a
+            # zero-filled latent of the expected shape so the VAE still
+            # touches its full decode path.
+            z = self._dummy_latent(int(height), int(width), int(num_frames_req))
+
+        z = z.to(device=self.device, dtype=self.dtype)
 
         sp = req.sampling_params
         output_type = sp.output_type or self.od_config.output_type or "np"

@@ -78,6 +78,29 @@ def _load_config(od_config: OmniDiffusionConfig) -> dict:
     return config
 
 
+def _resolve_encoder_dims(te_cfg: dict) -> tuple[list[int], int]:
+    """Return ``(caption_channels, vector_cond_channels)`` from HF configs.
+
+    ``caption_channels = [ul2_d_model, byt5_d_model]`` and
+    ``vector_cond_channels = clip_hidden_size``. The config.yaml may override
+    the pretrained names; hidden sizes are pulled from ``AutoConfig`` so
+    encoder weights are not materialized.
+    """
+    from transformers import AutoConfig
+
+    ul2_name = te_cfg.get("ul2_pretrained", "google/ul2")
+    byt5_name = te_cfg.get("byt5_pretrained", "google/byt5-large")
+    clip_name = te_cfg.get("clip_pretrained", "laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90K")
+
+    ul2_dim = int(AutoConfig.from_pretrained(ul2_name).d_model)
+    byt5_dim = int(AutoConfig.from_pretrained(byt5_name).d_model)
+    clip_cfg = AutoConfig.from_pretrained(clip_name)
+    clip_text_cfg = getattr(clip_cfg, "text_config", clip_cfg)
+    clip_dim = int(clip_text_cfg.hidden_size)
+
+    return [ul2_dim, byt5_dim], clip_dim
+
+
 # ---------------------------------------------------------------------------
 # Transformer construction
 # ---------------------------------------------------------------------------
@@ -270,13 +293,20 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
         self.vae_scale_factor_spatial = vae_ds[1]
 
         in_channels = len(vae_cfg.get("scaling_factor", [0] * 16))
-        # Caption channels derived from config (avoid loading actual encoders
-        # here — we only need the dimensions for the transformer constructor).
-        caption_channels = [
-            int(te_cfg.get("ul2_hidden_size", 4096)),
-            int(te_cfg.get("byt5_hidden_size", 1472)),
-        ]
-        vector_cond_channels = int(te_cfg.get("clip_hidden_size", 768))
+        # Caption channels match the actual encoder hidden sizes. Stage 1
+        # does not load the encoders; pull dimensions from their HF configs
+        # (weights are not materialized). The text_encoder section of the
+        # Marey config.yaml may override the pretrained names but does not
+        # carry hidden sizes, so we look them up here.
+        caption_channels, vector_cond_channels = _resolve_encoder_dims(te_cfg)
+
+        # Cached encoder dims — used to fabricate zero embeddings during the
+        # diffusion engine's dummy/warmup run (which arrives with an empty
+        # `additional_information`).
+        self._caption_channels = caption_channels
+        self._vector_cond_channels = vector_cond_channels
+        self._ul2_max_length = int(te_cfg.get("ul2_max_length", 300))
+        self._byt5_max_length = int(te_cfg.get("byt5_max_length", 70))
 
         self.transformer = _create_transformer_from_config(
             model_cfg, te_cfg, in_channels, caption_channels, vector_cond_channels,
@@ -317,6 +347,19 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
     @property
     def current_timestep(self):
         return self._current_timestep
+
+    # -- Dummy encoder tensors (warmup/profile) ------------------------------
+
+    def _dummy_encoder_tensors(self) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
+        device = self.device
+        dtype = self.transformer.dtype
+        ul2_dim, byt5_dim = self._caption_channels
+        lengths = (self._ul2_max_length, self._byt5_max_length)
+        dims = (ul2_dim, byt5_dim)
+        embeds = [torch.zeros((1, L, D), device=device, dtype=dtype) for L, D in zip(lengths, dims)]
+        masks = [torch.ones((1, L), device=device, dtype=torch.bool) for L in lengths]
+        vec = torch.zeros((1, self._vector_cond_channels), device=device, dtype=dtype)
+        return embeds, masks, vec
 
     # -- Latent preparation --------------------------------------------------
 
@@ -361,11 +404,11 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
         prompt_embeds = add_info.get("prompt_embeds")
         prompt_masks = add_info.get("prompt_masks")
         vector_cond = add_info.get("vector_cond")
+        # The diffusion engine's warmup issues a dummy OmniTextPrompt with no
+        # `additional_information`. Fabricate zero-filled encoder tensors of
+        # the expected shape so the warmup executes the full transformer path.
         if prompt_embeds is None or vector_cond is None:
-            raise ValueError(
-                "MareyDitPipeline requires prompt_embeds and vector_cond in "
-                "additional_information (populated by the text-encoder stage)."
-            )
+            prompt_embeds, prompt_masks, vector_cond = self._dummy_encoder_tensors()
         negative_prompt_embeds = add_info.get("neg_prompt_embeds")
         negative_prompt_masks = add_info.get("neg_prompt_masks")
         negative_vector_cond = add_info.get("neg_vector_cond")

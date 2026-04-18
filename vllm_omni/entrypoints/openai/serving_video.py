@@ -95,6 +95,15 @@ class OmniOpenAIServingVideo:
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
 
+        # Forward the prompt text to stage-0 models that read it from
+        # runtime_additional_information (e.g. Marey's MareyTextEncoder,
+        # which ignores input_ids). Non-consumers just ignore these keys.
+        add_info: dict[str, Any] = dict(prompt.get("additional_information") or {})
+        add_info.setdefault("prompt_text", request.prompt)
+        if request.negative_prompt is not None:
+            add_info.setdefault("negative_prompt_text", request.negative_prompt)
+        prompt["additional_information"] = add_info
+
         gen_params = OmniDiffusionSamplingParams()
 
         input_image = None if reference_image is None else reference_image.data
@@ -294,14 +303,22 @@ class OmniOpenAIServingVideo:
                 detail="Stage configs not found. Start server with an omni diffusion model.",
             )
 
-        # Video generation endpoint only supports diffusion stages.
+        # Video generation accepts llm stages feeding into diffusion stages
+        # (e.g. Marey's staged text-encoder → DiT → VAE pipeline), but the
+        # last stage must be a diffusion stage that produces frames.
+        allowed_stage_types = {"diffusion", "llm"}
         for stage in stage_configs:
             stage_type = get_stage_type(stage)
-            if stage_type != "diffusion":
+            if stage_type not in allowed_stage_types:
                 raise HTTPException(
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-                    detail=f"Video generation only supports diffusion stages, found '{stage_type}' stage.",
+                    detail=f"Video generation supports diffusion/llm stages, found '{stage_type}' stage.",
                 )
+        if get_stage_type(stage_configs[-1]) != "diffusion":
+            raise HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                detail="Video generation requires the final stage to be a diffusion stage.",
+            )
 
         # Common generation logic for both paths
         engine_client = cast(AsyncOmni, self._engine_client)
