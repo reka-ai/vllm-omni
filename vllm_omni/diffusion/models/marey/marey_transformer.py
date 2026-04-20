@@ -669,20 +669,33 @@ class MareyFluxAttention(nn.Module):
                 q_y = q_y_t.transpose(1, 2)
                 k_y = k_y_t.transpose(1, 2)
 
-        # Concatenate text + visual for joint attention: [B, N_x+N_y, heads, head_dim]
-        # q = torch.cat([q_x, q_y], dim=1)
-        # k = torch.cat([k_x, k_y], dim=1)
-        # v = torch.cat([v_x, v_y], dim=1)
+        # Joint attention over [visual; text]. Under SP (ulysses/ring), x is
+        # sharded on the sequence dim while y is replicated, and the backend
+        # handles the y-rear-concat via AttentionMetadata.joint_*. Without SP,
+        # backends (FlashAttentionImpl, SDPA) ignore those fields — so concat
+        # explicitly before the attention call.
+        try:
+            from vllm_omni.diffusion.distributed.parallel_state import (
+                get_sequence_parallel_world_size,
+            )
+            _sp_world_size = get_sequence_parallel_world_size()
+        except Exception:
+            _sp_world_size = 1
 
-        attn_metadata = AttentionMetadata(
-            joint_query=q_y,
-            joint_key=k_y,
-            joint_value=v_y,
-            joint_strategy="rear",
-        )
+        if _sp_world_size > 1:
+            attn_metadata = AttentionMetadata(
+                joint_query=q_y,
+                joint_key=k_y,
+                joint_value=v_y,
+                joint_strategy="rear",
+            )
+            out = self.attn(q_x, k_x, v_x, attn_metadata=attn_metadata)
+        else:
+            q = torch.cat([q_x, q_y], dim=1)
+            k = torch.cat([k_x, k_y], dim=1)
+            v = torch.cat([v_x, v_y], dim=1)
+            out = self.attn(q, k, v)
 
-        # Attention
-        out = self.attn(q_x, k_x, v_x, attn_metadata=attn_metadata)  # [B, N_x+N_y, heads, head_dim]
         out = out.flatten(2, 3)  # [B, N_x+N_y, dim]
         out = out.type_as(x)
 
