@@ -973,6 +973,7 @@ dependencies = [
     { name = "torch" },
 ]
 wheels = [
+    { url = "https://files.pythonhosted.org/packages/41/8a/dc89594b1a332c1f421a67e235dc956f116c7241fbd2c04bbbee96ad4f9f/fa3_fwd-0.0.2-cp39-abi3-manylinux_2_24_aarch64.whl", hash = "sha256:869225e83021a42e6af1694ffb9f13755beb03829d469745d21f19e7d2cee2fc", size = 27878573, upload-time = "2026-03-26T15:45:47.145Z" },
     { url = "https://files.pythonhosted.org/packages/95/48/ad4d2a53235738b2395546eab65c547de0523e450dc0a7e5f04b9d1e17a3/fa3_fwd-0.0.2-cp39-abi3-manylinux_2_24_x86_64.whl", hash = "sha256:1fddac2fb32bcb446ebef7359387e863b46323961e53c4975038eebb8b9f2ceb", size = 27354168, upload-time = "2026-02-11T12:37:12.469Z" },
 ]
 
@@ -1299,6 +1300,7 @@ wheels = [
 name = "griffelib"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ad/06/eccbd311c9e2b3ca45dbc063b93134c57a1ccc7607c5e545264ad092c4a9/griffelib-2.0.0.tar.gz", hash = "sha256:e504d637a089f5cab9b5daf18f7645970509bf4f53eda8d79ed71cce8bd97934", size = 166312, upload-time = "2026-03-23T21:06:55.954Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4d/51/c936033e16d12b627ea334aaaaf42229c37620d0f15593456ab69ab48161/griffelib-2.0.0-py3-none-any.whl", hash = "sha256:01284878c966508b6d6f1dbff9b6fa607bc062d8261c5c7253cb285b06422a7f", size = 142004, upload-time = "2026-02-09T19:09:40.561Z" },
 ]
@@ -7397,6 +7399,7 @@ dependencies = [
     { name = "soundfile" },
     { name = "sox" },
     { name = "timm" },
+    { name = "torch" },
     { name = "torchmetrics" },
     { name = "torchsde" },
     { name = "tqdm" },
@@ -7491,6 +7494,7 @@ requires-dist = [
     { name = "soundfile", marker = "extra == 'dev'", specifier = ">=0.13.1" },
     { name = "sox", specifier = ">=1.5.0" },
     { name = "timm", specifier = ">=1.0.3" },
+    { name = "torch" },
     { name = "torchmetrics", specifier = "==1.9.0" },
     { name = "torchsde", specifier = ">=0.2.6" },
     { name = "tqdm", specifier = ">=4.66.0" },
