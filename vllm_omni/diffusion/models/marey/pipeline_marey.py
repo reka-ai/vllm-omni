@@ -27,6 +27,7 @@ from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.models.marey._dumper import create_writer
 from vllm_omni.diffusion.models.marey.marey_transformer import MareyTransformer
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -447,6 +448,8 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
 
         use_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
 
+        dumper = create_writer(req.request_id)
+
         # Timesteps
         timesteps = _create_flow_timesteps(
             num_steps=num_steps,
@@ -484,6 +487,35 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
             generator=generator,
             latents=sp.latents,
         )
+
+        if dumper.enabled:
+            dumper.write_inputs(
+                prompt_embeds=prompt_embeds,
+                prompt_masks=prompt_masks,
+                vector_cond=vector_cond,
+                neg_prompt_embeds=negative_prompt_embeds,
+                neg_prompt_masks=negative_prompt_masks,
+                neg_vector_cond=negative_vector_cond,
+                meta={
+                    "request_id": req.request_id,
+                    "height": height,
+                    "width": width,
+                    "num_frames": num_frames,
+                    "num_steps": num_steps,
+                    "guidance_scale": guidance_scale,
+                    "use_cfg": use_cfg,
+                    "fps": sp.fps,
+                    "seed": sp.seed,
+                    "flow_shift": self.flow_shift,
+                    "num_train_timesteps": self.num_train_timesteps,
+                    "dtype": str(dtype),
+                },
+            )
+            dumper.write_initial(
+                initial_noise=latents,
+                timesteps=timesteps,
+                guidance_schedule=guidance_schedule,
+            )
 
         # Extra features + conditioning tensors
         model_cfg = self.config.get("model", {})
@@ -524,10 +556,18 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
                 gs_i = guidance_schedule[i] if guidance_schedule is not None else guidance_scale
                 use_uncond = use_cfg and ((not self.skip_uncond) or (gs_i > 1.0))
 
+                if dumper.enabled:
+                    dumper.begin_step(i)
+                    dumper.write_step_tensor("z_in", z)
+                    dumper.write_step_tensor("timestep", t_input)
+                    dumper.write_step_tensor("gs", float(gs_i))
+
                 pred_cond = _model_forward(
                     z, t_input, prompt_embeds, vector_cond, prompt_masks,
                     ef=extra_features,
                 )
+                if dumper.enabled:
+                    dumper.write_step_tensor("pred_cond", pred_cond)
 
                 if use_uncond:
                     pred_uncond = _model_forward(
@@ -535,14 +575,22 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
                         negative_prompt_masks,
                         ef=uncond_extra_features,
                     )
+                    if dumper.enabled:
+                        dumper.write_step_tensor("pred_uncond", pred_uncond)
                     v_pred = pred_uncond + gs_i * (pred_cond - pred_uncond)
                 else:
                     v_pred = pred_cond
+
+                if dumper.enabled:
+                    dumper.write_step_tensor("v_pred", v_pred)
 
                 sigma_t = (t / self.num_train_timesteps).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
                 x0 = z - sigma_t * v_pred
                 if clip_value is not None and clip_value > 0:
                     x0 = torch.clamp(x0, -clip_value, clip_value)
+
+                if dumper.enabled:
+                    dumper.write_step_tensor("x0", x0)
 
                 if i < len(timesteps) - 1:
                     sigma_s = (timesteps[i + 1] / self.num_train_timesteps).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
@@ -557,6 +605,8 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
                     variance = sigma_ts_div_t_sq * sigma_s ** 2
 
                     noise = torch.randn_like(z, generator=generator)
+                    if dumper.enabled:
+                        dumper.write_step_tensor("noise", noise)
                     z = mean + torch.sqrt(variance) * noise
                 else:
                     z = x0
@@ -564,6 +614,9 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
                 pbar.update()
 
         self._current_timestep = None
+
+        if dumper.enabled:
+            dumper.write_final(z)
 
         # Stage output: final latents. The diffusion engine stores
         # ``DiffusionOutput.output`` on the downstream ``OmniRequestOutput``
