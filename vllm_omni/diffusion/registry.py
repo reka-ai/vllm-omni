@@ -147,6 +147,11 @@ _DIFFUSION_MODELS = {
         "pipeline_marey",
         "MareyPipeline",
     ),
+    "DumpMareyPipeline": (
+        "marey",
+        "dump_pipeline",
+        "DumpMareyPipeline",
+    ),
 }
 
 
@@ -164,6 +169,7 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "MareyPipeline",
+    "DumpMareyPipeline",
 }
 
 
@@ -323,6 +329,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HeliosPyramidPipeline": "get_helios_post_process_func",
     "Flux2Pipeline": "get_flux2_post_process_func",
     "MareyPipeline": "get_marey_post_process_func",
+    "DumpMareyPipeline": "get_marey_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -340,6 +347,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",
     "MareyPipeline": "get_marey_pre_process_func",
+    "DumpMareyPipeline": "get_marey_pre_process_func",
 }
 
 

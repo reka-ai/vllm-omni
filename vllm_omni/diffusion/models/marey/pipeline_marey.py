@@ -702,6 +702,28 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         seq_cond_masks = [ul2_mask, byt5_mask]
         return seq_cond, seq_cond_masks, vector_cond
 
+    # -- Noise sampling (override points for instrumentation) ---------------
+
+    def _sample_initial_noise(
+        self,
+        shape: tuple[int, ...],
+        generator: torch.Generator | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Sample the initial latent noise. Override to load from disk for verification."""
+        return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+
+    def _sample_step_noise(
+        self,
+        z: torch.Tensor,
+        generator: torch.Generator | None,
+        step_idx: int,
+    ) -> torch.Tensor:
+        """Sample per-step DDPM noise. Override to load from disk for verification."""
+        del step_idx  # unused in default impl; kept for override symmetry
+        return torch.randn_like(z, generator=generator)
+
     # -- Latent preparation --------------------------------------------------
 
     def prepare_latents(
@@ -726,7 +748,7 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         latent_h = math.ceil(height / self.vae_scale_factor_spatial)
         latent_w = math.ceil(width / self.vae_scale_factor_spatial)
         shape = (batch_size, num_channels_latents, num_latent_frames, latent_h, latent_w)
-        return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        return self._sample_initial_noise(shape, generator, device, dtype)
 
     # -- Forward (DDPM flow-matching loop) -----------------------------------
 
@@ -914,7 +936,7 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                     mean = alpha_ts * sigma_s_div_t_sq * z + alpha_s * sigma_ts_div_t_sq * x0
                     variance = sigma_ts_div_t_sq * sigma_s ** 2
 
-                    noise = torch.randn_like(z, generator=generator)
+                    noise = self._sample_step_noise(z, generator, step_idx=i)
                     z = mean + torch.sqrt(variance) * noise
                 else:
                     z = x0

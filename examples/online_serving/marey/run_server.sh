@@ -51,18 +51,27 @@ env_args=(
     MOONVALLEY_AI_PATH="${MOONVALLEY_AI_PATH}"
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 )
-[[ -n "${HF_HOME:-}" ]]                && env_args+=("HF_HOME=${HF_HOME}")
-[[ -n "${VLLM_OMNI_STORAGE_PATH:-}" ]] && env_args+=("VLLM_OMNI_STORAGE_PATH=${VLLM_OMNI_STORAGE_PATH}")
+[[ -n "${HF_HOME:-}" ]]                       && env_args+=("HF_HOME=${HF_HOME}")
+[[ -n "${VLLM_OMNI_STORAGE_PATH:-}" ]]        && env_args+=("VLLM_OMNI_STORAGE_PATH=${VLLM_OMNI_STORAGE_PATH}")
 
-# Debug / reproducibility toggles — uncomment and append to env_args to use:
-# env_args+=("MAREY_DUMP_DIR=/path/to/pipeline_dump/")
-# env_args+=("MAREY_LOAD_INITIAL_NOISE=/path/to/z_initial_noise.pt")
-# env_args+=("MAREY_LOAD_STEP_NOISE_DIR=/path/to/step_noise_dir/")
+# Debug / reproducibility toggles — forwarded to the worker process and
+# consumed by DumpMixin (see vllm_omni/diffusion/debug/dump.py). Inert unless
+# MAREY_PIPELINE_CLASS=DumpMareyPipeline is also set.
+[[ -n "${MAREY_DUMP_DIR:-}" ]]                && env_args+=("MAREY_DUMP_DIR=${MAREY_DUMP_DIR}")
+[[ -n "${MAREY_LOAD_INITIAL_NOISE:-}" ]]      && env_args+=("MAREY_LOAD_INITIAL_NOISE=${MAREY_LOAD_INITIAL_NOISE}")
+[[ -n "${MAREY_LOAD_STEP_NOISE_DIR:-}" ]]     && env_args+=("MAREY_LOAD_STEP_NOISE_DIR=${MAREY_LOAD_STEP_NOISE_DIR}")
+
+# Pipeline class selector: defaults to MareyPipeline. Set to DumpMareyPipeline
+# (registered in vllm_omni/diffusion/registry.py) to enable instrumentation.
+MAREY_PIPELINE_CLASS="${MAREY_PIPELINE_CLASS:-MareyPipeline}"
+echo "Pipeline class:     $MAREY_PIPELINE_CLASS"
+
+VLLM_OMNI_PYTHON="${VLLM_OMNI_PYTHON:-${VLLM_OMNI_PROJECT}/.venv/bin/python}"
 
 env "${env_args[@]}" \
-uv run --project "${VLLM_OMNI_PROJECT}" vllm-omni serve "$MODEL" --omni \
+"${VLLM_OMNI_PYTHON}" -m vllm_omni.entrypoints.cli.main serve "$MODEL" --omni \
     --port "$PORT" \
-    --model-class-name MareyPipeline \
+    --model-class-name "$MAREY_PIPELINE_CLASS" \
     --flow-shift "$FLOW_SHIFT" \
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
     --ulysses-degree "$ULYSSES_DEGREE"
