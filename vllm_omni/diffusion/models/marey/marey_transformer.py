@@ -32,6 +32,7 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -505,10 +506,36 @@ class SwiGLUFFN(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _validate_marey_attn_tp(num_heads: int, num_kv_heads: int, tp_size: int) -> None:
+    """Guard against silently-wrong TP splits.
+
+    QKVParallelLinear replicates KV heads when ``num_kv_heads < tp_size``,
+    but Marey's joint-attention math assumes each rank holds a proper
+    subset of heads — so we enforce exact divisibility here, matching
+    Z-Image's validation.
+    """
+    if tp_size <= 0:
+        raise ValueError(f"tensor_parallel_size must be > 0, got {tp_size}")
+    if num_heads % tp_size != 0:
+        raise ValueError(
+            f"Marey requires num_heads % tensor_parallel_size == 0, "
+            f"got num_heads={num_heads}, tp={tp_size}."
+        )
+    if num_kv_heads % tp_size != 0:
+        raise ValueError(
+            f"Marey requires num_kv_heads % tensor_parallel_size == 0, "
+            f"got num_kv_heads={num_kv_heads}, tp={tp_size}."
+        )
+
+
 class MareyFluxAttention(nn.Module):
     """Multimodal attention for MMDiT: jointly attends over visual (x) and text (y) tokens.
 
-    Separate Q/KV projections per stream, concat for joint attention, then split outputs back.
+    Per stream we project QKV through a single ``QKVParallelLinear`` — the
+    canonical TP pattern. Concatenating K and V in a plain
+    ``ColumnParallelLinear`` (as this module used to do) silently gives
+    garbage under TP because the even weight split cuts across the K/V
+    boundary (e.g. with tp=2 rank 0 gets all K, rank 1 gets all V).
     """
 
     def __init__(
@@ -531,32 +558,36 @@ class MareyFluxAttention(nn.Module):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.share_weights = share_weights
 
-        kv_dim = self.num_kv_heads * self.head_dim
-
-        # Visual stream projections
-        self.q_linear_x = ColumnParallelLinear(dim, dim, bias=qkv_bias, gather_output=False, return_bias=False)
-        self.kv_linear_x = ColumnParallelLinear(dim, kv_dim * 2, bias=qkv_bias, gather_output=False, return_bias=False)
         tp_size = get_tensor_model_parallel_world_size()
-        tp_num_heads = num_heads // tp_size
-        tp_num_kv_heads = self.num_kv_heads // tp_size
+        _validate_marey_attn_tp(num_heads, self.num_kv_heads, tp_size)
 
-        # Per-head QK norm (checkpoint stores weights of shape [head_dim])
+        # Visual stream: merged QKV projection (handles head sharding
+        # correctly; replaces the separate q_linear_x + kv_linear_x).
+        self.qkv_linear_x = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=self.head_dim,
+            total_num_heads=num_heads,
+            total_num_kv_heads=self.num_kv_heads,
+            bias=qkv_bias,
+            return_bias=False,
+        )
         self.q_norm_x = LlamaRMSNorm(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm_x = LlamaRMSNorm(self.head_dim) if qk_norm else nn.Identity()
         self.proj_x = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True, return_bias=False)
 
-        # Text stream projections (separate or shared with visual)
+        # Text stream: separate or shared with visual.
         if not share_weights:
-            self.q_linear_y = ColumnParallelLinear(dim, dim, bias=qkv_bias, gather_output=False, return_bias=False)
-            self.kv_linear_y = ColumnParallelLinear(
-                dim, kv_dim * 2, bias=qkv_bias, gather_output=False, return_bias=False
+            self.qkv_linear_y = QKVParallelLinear(
+                hidden_size=dim,
+                head_size=self.head_dim,
+                total_num_heads=num_heads,
+                total_num_kv_heads=self.num_kv_heads,
+                bias=qkv_bias,
+                return_bias=False,
             )
             self.q_norm_y = LlamaRMSNorm(self.head_dim) if qk_norm else nn.Identity()
             self.k_norm_y = LlamaRMSNorm(self.head_dim) if qk_norm else nn.Identity()
             self.proj_y = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True, return_bias=False)
-
-        self.tp_num_heads = tp_num_heads
-        self.tp_num_kv_heads = tp_num_kv_heads
 
         # RoPE config
         if rope_channels_ratio is not None and rope_channels_ratio > 0.0:
@@ -575,26 +606,28 @@ class MareyFluxAttention(nn.Module):
             self.rope_dim = None
 
         self.attn = Attention(
-            num_heads=self.tp_num_heads,
+            num_heads=self.qkv_linear_x.num_heads,
             head_size=self.head_dim,
-            num_kv_heads=self.tp_num_kv_heads,
+            num_kv_heads=self.qkv_linear_x.num_kv_heads,
             softmax_scale=self.scale,
             causal=False,
         )
 
-    def _project_q(self, x: torch.Tensor, linear: nn.Module, norm: nn.Module) -> torch.Tensor:
-        q = linear(x)
-        q = q.unflatten(-1, (self.tp_num_heads, self.head_dim))
-        return norm(q)
-
-    def _project_kv(
-        self, x: torch.Tensor, linear: nn.Module, norm: nn.Module
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        kv = linear(x)
-        kv = kv.unflatten(-1, (2, self.tp_num_kv_heads, self.head_dim))
-        k, v = kv.unbind(dim=-3)
-        k = norm(k)
-        return k, v
+    def _project_qkv(
+        self,
+        x: torch.Tensor,
+        qkv_linear: QKVParallelLinear,
+        q_norm: nn.Module,
+        k_norm: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        qkv = qkv_linear(x)
+        q_size = qkv_linear.num_heads * self.head_dim
+        kv_size = qkv_linear.num_kv_heads * self.head_dim
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        q = q.unflatten(-1, (qkv_linear.num_heads, self.head_dim))
+        k = k.unflatten(-1, (qkv_linear.num_kv_heads, self.head_dim))
+        v = v.unflatten(-1, (qkv_linear.num_kv_heads, self.head_dim))
+        return q_norm(q), k_norm(k), v
 
     def forward(
         self,
@@ -604,21 +637,19 @@ class MareyFluxAttention(nn.Module):
         y_temporal_pos: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.share_weights:
-            q_linear_y, kv_linear_y = self.q_linear_x, self.kv_linear_x
+            qkv_linear_y = self.qkv_linear_x
             q_norm_y, k_norm_y = self.q_norm_x, self.k_norm_x
             proj_y = self.proj_x
         else:
-            q_linear_y, kv_linear_y = self.q_linear_y, self.kv_linear_y
+            qkv_linear_y = self.qkv_linear_y
             q_norm_y, k_norm_y = self.q_norm_y, self.k_norm_y
             proj_y = self.proj_y
 
         B, N_x, _ = x.shape
         _, N_y, _ = y.shape
 
-        q_x = self._project_q(x, self.q_linear_x, self.q_norm_x)
-        q_y = self._project_q(y, q_linear_y, q_norm_y)
-        k_x, v_x = self._project_kv(x, self.kv_linear_x, self.k_norm_x)
-        k_y, v_y = self._project_kv(y, kv_linear_y, k_norm_y)
+        q_x, k_x, v_x = self._project_qkv(x, self.qkv_linear_x, self.q_norm_x, self.k_norm_x)
+        q_y, k_y, v_y = self._project_qkv(y, qkv_linear_y, q_norm_y, k_norm_y)
 
         # Apply RoPE to visual tokens (and optionally text tokens)
         if self.rope_dim is not None and temporal_pos is not None:
@@ -1252,11 +1283,34 @@ class MareyTransformer(nn.Module):
         ".mlp_y.fc2.": ".mlp_y.w3.",
     }
 
+    # Checkpoint stores ``q_linear_{x,y}`` separately from ``kv_linear_{x,y}``.
+    # The in-tree module now fuses them into ``qkv_linear_{x,y}``, so Q maps
+    # directly (shard_id='q') and KV — a concatenated ``[K; V]`` weight — is
+    # split row-wise and loaded as two shards (see ``load_weights``).
+    _QKV_STACKED_MAPPING = (
+        (".qkv_linear_x.", ".q_linear_x.", "q"),
+        (".qkv_linear_y.", ".q_linear_y.", "q"),
+    )
+    _QKV_KV_MAPPING = (
+        (".kv_linear_x.", ".qkv_linear_x."),
+        (".kv_linear_y.", ".qkv_linear_y."),
+    )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights with handling for TP sharding and projection remapping."""
         params_dict = dict(self.named_parameters())
         buffers_dict = dict(self.named_buffers())
         loaded_params: set[str] = set()
+
+        def _load_qkv_shard(target_name: str, weight: torch.Tensor, shard_id: str) -> bool:
+            if target_name not in params_dict:
+                return False
+            param = params_dict[target_name]
+            loader = getattr(param, "weight_loader", None)
+            if loader is None:
+                return False
+            loader(param, weight, shard_id)
+            return True
 
         for name, loaded_weight in weights:
             original_name = name
@@ -1265,6 +1319,38 @@ class MareyTransformer(nn.Module):
                 if old in name:
                     name = name.replace(old, new)
                     break
+
+            # kv_linear_* → qkv_linear_* with the concatenated [K; V] weight
+            # split row-wise into two shards.
+            kv_handled = False
+            for kv_prefix, qkv_prefix in self._QKV_KV_MAPPING:
+                if kv_prefix not in name:
+                    continue
+                target_name = name.replace(kv_prefix, qkv_prefix)
+                if target_name not in params_dict:
+                    break
+                half = loaded_weight.shape[0] // 2
+                ok_k = _load_qkv_shard(target_name, loaded_weight[:half], "k")
+                ok_v = _load_qkv_shard(target_name, loaded_weight[half:], "v")
+                if ok_k and ok_v:
+                    loaded_params.add(original_name)
+                    kv_handled = True
+                break
+            if kv_handled:
+                continue
+
+            # q_linear_* → qkv_linear_* shard 'q'.
+            q_handled = False
+            for param_prefix, weight_prefix, shard_id in self._QKV_STACKED_MAPPING:
+                if weight_prefix not in name:
+                    continue
+                target_name = name.replace(weight_prefix, param_prefix)
+                if _load_qkv_shard(target_name, loaded_weight, shard_id):
+                    loaded_params.add(original_name)
+                    q_handled = True
+                break
+            if q_handled:
+                continue
 
             if name in params_dict:
                 param = params_dict[name]
