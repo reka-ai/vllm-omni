@@ -63,8 +63,19 @@ def _is_rank_zero() -> bool:
         return True
 
 
-def _prepare_tensor(t: torch.Tensor, cast_fp32: bool) -> torch.Tensor:
-    out = t.detach().cpu()
+def _prepare_tensor(t: Any, cast_fp32: bool) -> torch.Tensor:
+    """Normalise ``t`` to a CPU tensor. Accepts tensors, lists, or scalars.
+
+    ``_create_flow_timesteps`` returns a plain Python list of 0-d tensors, for
+    instance — we coerce to a 1-d tensor so the dump has a single ``.pt`` file
+    regardless of upstream shape.
+    """
+    if isinstance(t, torch.Tensor):
+        out = t.detach().cpu()
+    elif isinstance(t, list) and t and all(isinstance(x, torch.Tensor) for x in t):
+        out = torch.stack([x.detach().cpu() for x in t])
+    else:
+        out = torch.as_tensor(t)
     if cast_fp32 and out.is_floating_point() and out.dtype != torch.float32:
         out = out.float()
     return out
@@ -153,7 +164,7 @@ class DumpWriter:
         self,
         *,
         initial_noise: torch.Tensor,
-        timesteps: torch.Tensor,
+        timesteps: torch.Tensor | list[torch.Tensor],
         guidance_schedule: list[float] | None,
     ) -> None:
         self._save(self.root / "initial_noise.pt", initial_noise)
