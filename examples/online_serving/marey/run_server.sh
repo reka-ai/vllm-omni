@@ -55,6 +55,8 @@ env_args=(
 )
 [[ -n "${HF_HOME:-}" ]]                && env_args+=("HF_HOME=${HF_HOME}")
 [[ -n "${VLLM_OMNI_STORAGE_PATH:-}" ]] && env_args+=("VLLM_OMNI_STORAGE_PATH=${VLLM_OMNI_STORAGE_PATH}")
+[[ -n "${MAREY_DUMP_DIR:-}" ]]         && env_args+=("MAREY_DUMP_DIR=${MAREY_DUMP_DIR}")
+[[ -n "${MAREY_DUMP_FLOAT32:-}" ]]     && env_args+=("MAREY_DUMP_FLOAT32=${MAREY_DUMP_FLOAT32}")
 
 # Debug / reproducibility toggles — uncomment and append to env_args to use:
 # env_args+=("MAREY_DUMP_DIR=/path/to/pipeline_dump/")

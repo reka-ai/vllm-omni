@@ -16,6 +16,7 @@ import glob
 import logging
 import math
 import os
+import time
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -391,6 +392,15 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
     # -- Forward (DDPM flow-matching loop) -----------------------------------
 
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        logger.info("[marey-timing] stage=dit forward start request_id=%s", req.request_id)
+        _t_start = time.perf_counter()
+        try:
+            return self._forward_impl(req)
+        finally:
+            _elapsed = time.perf_counter() - _t_start
+            logger.info("[marey-timing] stage=dit forward end request_id=%s elapsed=%.3fs", req.request_id, _elapsed)
+
+    def _forward_impl(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         if len(req.prompts) != 1:
             raise ValueError("MareyDitPipeline only supports a single prompt per request.")
 

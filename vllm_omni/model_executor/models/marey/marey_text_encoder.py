@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Iterable
 from typing import Any
 
@@ -128,6 +129,30 @@ class MareyTextEncoder(nn.Module):
 
     @torch.no_grad()
     def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: Any = None,
+        inputs_embeds: torch.Tensor | None = None,
+        runtime_additional_information: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> OmniOutput:
+        logger.info("[marey-timing] stage=text_encoder forward start")
+        _t_start = time.perf_counter()
+        try:
+            return self._forward_impl(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                runtime_additional_information=runtime_additional_information,
+                **kwargs,
+            )
+        finally:
+            _elapsed = time.perf_counter() - _t_start
+            logger.info("[marey-timing] stage=text_encoder forward end elapsed=%.3fs", _elapsed)
+
+    def _forward_impl(
         self,
         input_ids: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,

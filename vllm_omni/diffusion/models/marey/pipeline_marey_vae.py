@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Iterable
 
 import torch
@@ -81,7 +82,7 @@ class MareyVaePipeline(nn.Module):
         self.vae, self.vae_init_error = load_vae(vae_cfg, "cpu", self.dtype)
         if self.vae is None:
             raise RuntimeError(f"MareyVaePipeline failed to load VAE: {self.vae_init_error}")
-
+        self.vae.to(self.device)
         ds = tuple(vae_cfg.get("downsample_factors", (4, 16, 16)))
         self.vae_scale_factor_temporal = ds[0]
         self.vae_scale_factor_spatial = ds[1]
@@ -96,6 +97,15 @@ class MareyVaePipeline(nn.Module):
         return torch.zeros((1, channels, lat_t, lat_h, lat_w), device=self.device, dtype=self.dtype)
 
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        logger.info("[marey-timing] stage=vae forward start request_id=%s", req.request_id)
+        _t_start = time.perf_counter()
+        try:
+            return self._forward_impl(req)
+        finally:
+            _elapsed = time.perf_counter() - _t_start
+            logger.info("[marey-timing] stage=vae forward end request_id=%s elapsed=%.3fs", req.request_id, _elapsed)
+
+    def _forward_impl(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         if len(req.prompts) != 1:
             raise ValueError("MareyVaePipeline only supports a single prompt per request.")
 
@@ -131,28 +141,24 @@ class MareyVaePipeline(nn.Module):
         if output_type == "latent":
             return DiffusionOutput(output=z)
 
-        self.vae.to(self.device)
-        try:
-            vae_t_ds = self.vae.downsample_factors[0]
-            num_latent_t = z.shape[2]
-            num_pixel_frames = num_latent_t * vae_t_ds
-            chunk = self.vae.frame_chunk_len
-            if num_latent_t <= 1:
-                num_pixel_frames = 1
-            elif chunk is not None and num_pixel_frames % chunk != 0:
-                num_pixel_frames = (num_pixel_frames // chunk) * chunk
+        vae_t_ds = self.vae.downsample_factors[0]
+        num_latent_t = z.shape[2]
+        num_pixel_frames = num_latent_t * vae_t_ds
+        chunk = self.vae.frame_chunk_len
+        if num_latent_t <= 1:
+            num_pixel_frames = 1
+        elif chunk is not None and num_pixel_frames % chunk != 0:
+            num_pixel_frames = (num_pixel_frames // chunk) * chunk
 
-            with torch.no_grad():
-                output = self.vae.decode(
-                    z,
-                    num_frames=num_pixel_frames,
-                    spatial_size=(int(height), int(width)),
-                )
-            if isinstance(output, tuple):
-                output = output[0]
-        finally:
-            self.vae.to("cpu")
-            torch.cuda.empty_cache()
+        with torch.no_grad():
+            output = self.vae.decode(
+                z,
+                num_frames=num_pixel_frames,
+                spatial_size=(int(height), int(width)),
+            )
+        if isinstance(output, tuple):
+            output = output[0]
+
 
         return DiffusionOutput(output=output)
 
