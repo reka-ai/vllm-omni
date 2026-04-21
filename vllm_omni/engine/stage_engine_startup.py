@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import os
+import socket
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -314,6 +316,31 @@ class OmniMasterServer:
             )
             return None
 
+        # If the worker advertises its own address and it differs from the
+        # master's, rewrite the input/output addresses so the engine on the
+        # worker can bind IPs it owns AND the master's client connects to
+        # the right host. Handshake stays in each side's local loopback —
+        # it's a wrapper↔subprocess channel that never crosses the network.
+        worker_address: str | None = msg.get("worker_address")
+        if worker_address and worker_address != self._address:
+            alloc = self._allocations[stage_id]
+            inp_port = alloc.input_bind_address.rsplit(":", 1)[-1]
+            out_port = alloc.output_bind_address.rsplit(":", 1)[-1]
+            self._allocations[stage_id] = StageAllocation(
+                handshake_bind_address=alloc.handshake_bind_address,
+                handshake_connect_address=alloc.handshake_connect_address,
+                input_bind_address=f"tcp://{worker_address}:{inp_port}",
+                input_connect_address=f"tcp://{worker_address}:{inp_port}",
+                output_bind_address=f"tcp://{worker_address}:{out_port}",
+                output_connect_address=f"tcp://{worker_address}:{out_port}",
+            )
+            logger.info(
+                "[OmniMasterServer] Stage %d announced worker_address=%s; "
+                "rewrote input/output addresses to it.",
+                stage_id,
+                worker_address,
+            )
+
         self.register_stage_config(
             stage_id,
             msg.get("stage_config"),
@@ -342,6 +369,36 @@ class OmniMasterServer:
         return stage_id
 
 
+def _detect_local_ip_for_peer(peer_address: str) -> str | None:
+    """Return the IP of the NIC the kernel would use to reach ``peer_address``.
+
+    Uses the classic UDP-connect trick: ``socket.connect`` on a UDP socket
+    doesn't send packets but causes the kernel to select a source address as
+    if it were about to. Honest answer for multi-homed hosts. Returns None on
+    any error so the caller can fall back to not advertising an address (old
+    single-node behavior).
+    """
+    try:
+        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as s:
+            # Port doesn't matter for UDP connect; just needs to be valid.
+            s.connect((peer_address, 1))
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
+def _resolve_worker_address(peer_address: str) -> str | None:
+    """Pick the address this worker should advertise to the master.
+
+    Order: ``VLLM_OMNI_WORKER_ADDRESS`` env var → autodetect via UDP trick
+    → None (fall back to old behavior: no rewrite, master uses its own IP).
+    """
+    override = os.environ.get("VLLM_OMNI_WORKER_ADDRESS")
+    if override:
+        return override
+    return _detect_local_ip_for_peer(peer_address)
+
+
 def register_stage_with_omni_master(
     *,
     omni_master_address: str,
@@ -367,6 +424,18 @@ def register_stage_with_omni_master(
                 "stage_id": omni_stage_id,
                 "stage_config": _serialize_stage_config(omni_stage_config),
             }
+            # Tell the master what IP this worker reaches it from, so the
+            # master can rewrite input/output addresses to point at us.
+            # Master only rewrites if worker_address != its own address,
+            # so single-node deployments stay byte-identical.
+            worker_address = _resolve_worker_address(omni_master_address)
+            if worker_address is not None:
+                payload["worker_address"] = worker_address
+                logger.info(
+                    "Stage %d advertising worker_address=%s",
+                    omni_stage_id,
+                    worker_address,
+                )
             if coordinator is not None:
                 coordinator_input, coordinator_output = coordinator.get_engine_socket_addresses()
                 payload["coordinator_input"] = coordinator_input

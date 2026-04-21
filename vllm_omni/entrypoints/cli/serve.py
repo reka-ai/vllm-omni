@@ -506,6 +506,17 @@ def run_headless(args: argparse.Namespace) -> None:
                 omni_stage_config=stage_cfg,
                 return_addresses=True,
             )
+            # The handshake socket is a strictly local wrapper↔subprocess
+            # channel (both on THIS node). The master allocates the port
+            # but encodes its own IP, which is unbindable from a remote
+            # headless worker. Rewrite to 127.0.0.1 so both the ROUTER
+            # bind below and the subprocess's DEALER connect use a
+            # loopback address local to this node. In single-node runs
+            # master_address is already 127.0.0.1 so this is a no-op.
+            # Input/output addresses stay untouched — those are the
+            # master's real sockets we must reach over the network.
+            handshake_port = handshake_address.rsplit(":", 1)[-1]
+            handshake_address = f"tcp://127.0.0.1:{handshake_port}"
             proc, _, _, _ = spawn_diffusion_proc(
                 model,
                 od_config,
@@ -513,7 +524,7 @@ def run_headless(args: argparse.Namespace) -> None:
                 request_address=request_address,
                 response_address=response_address,
             )
-            complete_diffusion_handshake(proc, handshake_address)
+            complete_diffusion_handshake(proc, handshake_address, args.stage_init_timeout)
             proc.join()
             if proc.exitcode not in (None, 0):
                 raise RuntimeError(f"Diffusion stage {stage_id} exited with code {proc.exitcode}")
