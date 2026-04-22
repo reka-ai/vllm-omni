@@ -623,9 +623,14 @@ def build_diffusion_config(
     else:
         physical_devices = list(range(current_omni_platform.get_device_count()))
 
-    if len(physical_devices) < num_devices_per_stage:
+    # On multi-node stages, only ``num_local_gpus`` must be available on this
+    # node; the global TP/SP group spans multiple machines.
+    required_local = od_config.num_local_gpus if od_config.nnodes > 1 else num_devices_per_stage
+    if len(physical_devices) < required_local:
         raise ValueError(
-            f"Stage {metadata.stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
+            f"Stage {metadata.stage_id} requires {required_local} local device(s) "
+            f"(nnodes={od_config.nnodes}, num_local_gpus={od_config.num_local_gpus}, "
+            f"world_size={num_devices_per_stage}), "
             f"but {len(physical_devices)} device(s) are available: {physical_devices}"
         )
 

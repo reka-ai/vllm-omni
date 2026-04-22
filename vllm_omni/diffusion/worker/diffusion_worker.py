@@ -92,18 +92,28 @@ class DiffusionWorker:
 
     def init_device(self) -> None:
         """Initialize the device and distributed environment."""
+        # ``num_gpus`` is the *global* world size (across all nodes of this
+        # stage). ``num_local_gpus`` is how many GPUs run on this node.
+        # ``self.rank`` is pre-computed as the global rank (node_rank *
+        # num_local_gpus + local_gpu_id) by the spawn layer.
         world_size = self.od_config.num_gpus
         rank = self.rank
 
+        # torch.distributed rendezvous. For a single-node stage this is
+        # loopback + the settled master_port; for a multi-node stage both
+        # come from od_config (same value on every node).
+        master_addr = self.od_config.dit_master_addr
+        master_port = self.od_config.dit_master_port or self.od_config.master_port
+
         # Set environment variables for distributed initialization
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(self.od_config.master_port)
+        os.environ["MASTER_ADDR"] = master_addr
+        os.environ["MASTER_PORT"] = str(master_port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
-        # Setup device
-        self.device = current_omni_platform.get_torch_device(rank)
+        # Setup device (local ordinal; global ``rank`` is for torch.distributed only)
+        self.device = current_omni_platform.get_torch_device(self.local_rank)
         current_omni_platform.set_device(self.device)
 
         # Create vllm_config for parallel configuration. Pass explicit device_config
@@ -140,6 +150,24 @@ class DiffusionWorker:
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
             )
             init_workspace_manager(self.device)
+
+            # Cross-node RPC dispatch group. On multi-node, the shared-memory
+            # broadcast_mq can't reach remote workers, so we broadcast RPCs over
+            # torch.distributed from global rank 0 to a subgroup that contains
+            # global rank 0 plus every rank on remote nodes.
+            # ``torch.distributed.new_group`` must be invoked by every process
+            # in the default group, even non-members — so we always call it.
+            self.cross_node_dispatch_group = None
+            if self.od_config.nnodes > 1:
+                nl = self.od_config.num_local_gpus
+                members = [0] + list(range(nl, self.od_config.num_gpus))
+                self.cross_node_dispatch_group = torch.distributed.new_group(ranks=members)
+                if rank in members:
+                    logger.info(
+                        "Worker %d joined cross-node dispatch group (members=%s)",
+                        rank,
+                        members,
+                    )
 
     def _create_profiler(self) -> WorkerProfiler | None:
         profiler_config = self.od_config.profiler_config
@@ -401,20 +429,30 @@ class WorkerProc:
         self.od_config = od_config
         self.gpu_id = gpu_id
 
+        # Remote-node workers (``node_rank > 0``) receive RPCs via
+        # torch.distributed rather than shared memory — they don't create a
+        # broadcast_mq reader or a result_mq, and ``broadcast_handle`` is None.
+        self.is_remote_node = broadcast_handle is None
+
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
 
-        # Initialize MessageQueue reader from handle
-        self.mq = MessageQueue.create_from_handle(broadcast_handle, gpu_id)
+        if self.is_remote_node:
+            self.mq = None
+            self.result_mq = None
+            self.result_mq_handle = None
+        else:
+            # Initialize MessageQueue reader from handle
+            self.mq = MessageQueue.create_from_handle(broadcast_handle, gpu_id)
 
-        self.result_mq = None
-        self.result_mq_handle = None
+            self.result_mq = None
+            self.result_mq_handle = None
 
-        # Setup result sender (only for rank 0)
-        if gpu_id == 0:
-            self.result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
-            self.result_mq_handle = self.result_mq.export_handle()
-            logger.info(f"Worker {gpu_id} created result MessageQueue")
+            # Setup result sender (only for rank 0)
+            if gpu_id == 0:
+                self.result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
+                self.result_mq_handle = self.result_mq.export_handle()
+                logger.info(f"Worker {gpu_id} created result MessageQueue")
 
         assert od_config.master_port is not None
 
@@ -473,6 +511,20 @@ class WorkerProc:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
             raise e
 
+    def _maybe_broadcast_msg_to_remote_nodes(self, msg: object) -> None:
+        """On multi-node, forward the RPC to workers on remote nodes.
+
+        Only global rank 0 (which owns the inbound SHM queue from the
+        orchestrator) acts as the cross-node bridge. The subgroup built in
+        ``DiffusionWorker.init_device`` contains global rank 0 plus every
+        rank on nodes with ``node_rank > 0``; node-0 ranks 1..num_local_gpus-1
+        stay on the pure SHM path and don't participate.
+        """
+        group = getattr(self.worker.worker, "cross_node_dispatch_group", None)
+        if group is None or self.gpu_id != 0:
+            return
+        torch.distributed.broadcast_object_list([msg], src=0, group=group)
+
     def worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers."""
         logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
@@ -491,6 +543,11 @@ class WorkerProc:
             if msg is None or len(msg) == 0:
                 logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
                 continue
+
+            # Fan the RPC out to remote-node workers before executing locally,
+            # so the NCCL collectives called inside execute_rpc stay in sync
+            # across nodes.
+            self._maybe_broadcast_msg_to_remote_nodes(msg)
 
             # Route message based on type
             if isinstance(msg, dict) and msg.get("type") == "rpc":
@@ -532,6 +589,56 @@ class WorkerProc:
             logger.warning("Worker %s: Shutdown encountered an error: %s", self.gpu_id, exc)
         self.context.term()
 
+    def worker_busy_loop_remote(self) -> None:
+        """Busy loop for workers on remote nodes (``node_rank > 0``).
+
+        These workers have no shared-memory broadcast_mq / result_mq — they
+        receive RPCs via ``torch.distributed.broadcast_object_list`` on the
+        cross-node dispatch group (source = global rank 0 on node 0) and
+        never reply. Results are dropped; only node 0 rank 0 answers the
+        orchestrator.
+        """
+        group = self.worker.worker.cross_node_dispatch_group
+        assert group is not None, "worker_busy_loop_remote requires a cross-node dispatch group"
+        logger.info(f"Worker {self.gpu_id} (remote) ready to receive RPCs via torch.distributed")
+
+        while self._running:
+            msg_list = [None]
+            try:
+                torch.distributed.broadcast_object_list(msg_list, src=0, group=group)
+            except Exception as exc:
+                logger.error("Remote worker %s: broadcast failed: %s", self.gpu_id, exc, exc_info=True)
+                continue
+            msg = msg_list[0]
+
+            if msg is None:
+                continue
+
+            if isinstance(msg, dict) and msg.get("type") == "shutdown":
+                logger.info("Remote worker %s: received shutdown", self.gpu_id)
+                self._running = False
+                continue
+
+            if isinstance(msg, dict) and msg.get("type") == "rpc":
+                try:
+                    self.execute_rpc(msg)  # result dropped: not the reply rank
+                except Exception as exc:
+                    logger.error("Remote worker %s: RPC error: %s", self.gpu_id, exc, exc_info=True)
+                continue
+
+            # Generation-request path (non-RPC legacy shape).
+            try:
+                self.worker.execute_model(msg, self.od_config)
+            except Exception as exc:
+                logger.error("Remote worker %s: execute_model error: %s", self.gpu_id, exc, exc_info=True)
+
+        logger.info("Remote event loop terminated.")
+        try:
+            self.worker.shutdown()
+        except Exception as exc:
+            logger.warning("Remote worker %s: shutdown error: %s", self.gpu_id, exc)
+        self.context.term()
+
     @staticmethod
     def worker_main(
         rank: int,
@@ -561,6 +668,36 @@ class WorkerProc:
         )
         worker_proc.worker_busy_loop()
         logger.info(f"Worker {rank}: Shutdown complete.")
+
+    @staticmethod
+    def worker_main_remote(
+        rank: int,
+        od_config: OmniDiffusionConfig,
+        pipe_writer: mp.connection.Connection,
+        worker_extension_cls: str | None = None,
+        custom_pipeline_args: dict[str, Any] | None = None,
+    ) -> None:
+        """Worker launched on a remote node (``node_rank > 0``).
+
+        No shared-memory inbox/outbox; RPCs arrive via torch.distributed on
+        the cross-node dispatch group. Only the rank-0 worker on node 0
+        replies to the orchestrator, so these workers never touch a result
+        queue.
+        """
+        from vllm_omni.plugins import load_omni_general_plugins
+
+        load_omni_general_plugins()
+        worker_proc = WorkerProc(
+            od_config,
+            gpu_id=rank,
+            broadcast_handle=None,  # signals remote-node mode
+            worker_extension_cls=worker_extension_cls,
+            custom_pipeline_args=custom_pipeline_args,
+        )
+        logger.info(f"Remote worker {rank}: ready.")
+        pipe_writer.send({"status": "ready", "result_handle": None})
+        worker_proc.worker_busy_loop_remote()
+        logger.info(f"Remote worker {rank}: Shutdown complete.")
 
 
 class WorkerWrapperBase:
@@ -600,9 +737,14 @@ class WorkerWrapperBase:
         # since re_init_pipeline will handle it. This avoids allocating memory
         # through CuMemAllocator twice, which causes assertion failures in
         # sleep mode.
+        #
+        # Global rank = node_rank * num_local_gpus + local gpu index. For
+        # single-node stages (nnodes=1, node_rank=0) this collapses to gpu_id.
+        num_local_gpus = od_config.num_local_gpus or od_config.num_gpus
+        global_rank = od_config.node_rank * num_local_gpus + gpu_id
         self.worker = worker_class(
             local_rank=gpu_id,
-            rank=gpu_id,
+            rank=global_rank,
             od_config=od_config,
             skip_load_model=(self.custom_pipeline_args is not None),
         )

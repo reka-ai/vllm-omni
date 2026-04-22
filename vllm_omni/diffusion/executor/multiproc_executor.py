@@ -64,7 +64,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._processes: list[mp.Process] = []
         self._closed = False
 
-        num_workers = self.od_config.num_gpus
+        # On multi-node stages, this executor only manages the workers that
+        # live on THIS node. Remote-node workers (``node_rank > 0``) are
+        # launched separately and receive RPCs via torch.distributed, not the
+        # shared-memory broadcast_mq.
+        num_workers = self.od_config.num_local_gpus or self.od_config.num_gpus
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
 
@@ -104,7 +108,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         od_config = self.od_config
         logger.info("Starting server...")
 
-        num_gpus = od_config.num_gpus
+        # Only the local-node workers live in this executor. In a single-node
+        # stage ``num_local_gpus == num_gpus`` so the loop is unchanged.
+        num_local_workers = od_config.num_local_gpus or od_config.num_gpus
         mp.set_start_method("spawn", force=True)
         processes = []
 
@@ -116,7 +122,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         scheduler_pipe_readers = []
         scheduler_pipe_writers = []
 
-        for i in range(num_gpus):
+        for i in range(num_local_workers):
             reader, writer = mp.Pipe(duplex=False)
             scheduler_pipe_writers.append(writer)
             process = mp.Process(

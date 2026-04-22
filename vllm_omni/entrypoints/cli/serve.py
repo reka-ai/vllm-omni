@@ -211,6 +211,48 @@ class OmniServeCommand(CLISubcommand):
             help="Port of the Omni orchestrator (master).",
         )
 
+        # Multi-node diffusion-stage flags. Names use the ``dit-`` prefix so
+        # they do not collide with upstream vLLM's ``--nnodes`` / ``--node-rank``
+        # (multi-node LLM / DP). Mapped to OmniDiffusionConfig in ``from_kwargs``.
+        omni_config_group.add_argument(
+            "--dit-master-addr",
+            type=str,
+            default=None,
+            help="torch.distributed rendezvous host for multi-node diffusion stages "
+            "(defaults to 'localhost' for single-node).",
+        )
+        omni_config_group.add_argument(
+            "--dit-master-port",
+            type=int,
+            default=None,
+            help="torch.distributed rendezvous port for multi-node diffusion stages. "
+            "Required when --dit-nnodes > 1 — must be the same on every node.",
+        )
+        omni_config_group.add_argument(
+            "--dit-nnodes",
+            type=int,
+            default=1,
+            dest="dit_nnodes",
+            help="Number of nodes in the diffusion (DiT) torch.distributed process group "
+            "(default: 1). Named dit-nnodes to avoid clashing with vLLM's --nnodes.",
+        )
+        omni_config_group.add_argument(
+            "--dit-node-rank",
+            type=int,
+            default=0,
+            dest="dit_node_rank",
+            help="This node's rank in the diffusion process group (default: 0). "
+            "Named dit-node-rank to avoid clashing with vLLM's --node-rank.",
+        )
+        omni_config_group.add_argument(
+            "--dit-num-local-gpus",
+            type=int,
+            default=None,
+            dest="dit_num_local_gpus",
+            help="GPUs on this node for the diffusion stage. "
+            "Defaults to num_gpus // dit-nnodes when not set.",
+        )
+
         # Diffusion model specific arguments
         omni_config_group.add_argument(
             "--num-gpus",
@@ -489,6 +531,37 @@ def run_headless(args: argparse.Namespace) -> None:
             inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
         inject_kv_stage_info(stage_cfg, stage_id)
         od_config = build_diffusion_config(model, stage_cfg, metadata)
+
+        # ``node_rank > 0`` means this node is a non-head worker of a
+        # multi-node diffusion stage. Skip orchestrator registration and
+        # per-stage ZMQ sockets entirely — just bring up the local workers
+        # and let them join the torch.distributed group anchored at
+        # dit_master_addr:dit_master_port on the head node.
+        if od_config.node_rank > 0:
+            from vllm_omni.diffusion.executor.remote_node_launcher import (
+                spawn_remote_node_workers,
+            )
+
+            logger.info(
+                "[Headless] Launching diffusion stage %d in worker-only mode "
+                "(node_rank=%d, nnodes=%d, num_local_gpus=%d; "
+                "torch.distributed rendezvous at %s:%s)",
+                stage_id,
+                od_config.node_rank,
+                od_config.nnodes,
+                od_config.num_local_gpus,
+                od_config.dit_master_addr,
+                od_config.dit_master_port,
+            )
+            worker_group = None
+            try:
+                worker_group = spawn_remote_node_workers(od_config)
+                worker_group.join()
+                return
+            finally:
+                logger.info("[Headless] Shutting down remote diffusion stage %d.", stage_id)
+                if worker_group is not None:
+                    worker_group.shutdown()
 
         logger.info(
             "[Headless] Launching diffusion stage %d via OmniMasterServer at %s:%d",

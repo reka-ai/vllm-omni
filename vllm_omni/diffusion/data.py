@@ -442,6 +442,21 @@ class OmniDiffusionConfig:
     # TODO: do not hard code
     master_port: int | None = None
 
+    # Multi-node torch.distributed rendezvous for a single diffusion stage.
+    # Defaults preserve single-node behavior: all ranks on one node, rendezvous
+    # over loopback. When nnodes > 1, ``dit_master_addr``/``dit_master_port``
+    # must point at the stage's head node (the one running ``node_rank == 0``)
+    # and every node must be launched with the same addr+port.
+    dit_master_addr: str = "localhost"
+    dit_master_port: int | None = None
+    # Total nodes participating in this stage's torch.distributed group.
+    nnodes: int = 1
+    # 0-indexed position of this node within the stage (0 = head node).
+    node_rank: int = 0
+    # GPUs to use on THIS node. If None, derived as ``num_gpus // nnodes``.
+    # When ``nnodes == 1`` this is just ``num_gpus``.
+    num_local_gpus: int | None = None
+
     # Worker extension class for custom functionality
     worker_extension_cls: str | None = None
 
@@ -561,6 +576,17 @@ class OmniDiffusionConfig:
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
 
+        # Multi-node rendezvous port: must be identical across every node in
+        # the stage, so skip settle_port's probe-for-free-port logic. Default
+        # to master_port for single-node compatibility.
+        if self.dit_master_port is None:
+            self.dit_master_port = self.master_port if self.nnodes == 1 else None
+        if self.nnodes > 1 and self.dit_master_port is None:
+            raise ValueError(
+                "nnodes > 1 requires dit_master_port to be set explicitly "
+                "(cannot be auto-assigned because every node must agree)."
+            )
+
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig
 
@@ -583,6 +609,24 @@ class OmniDiffusionConfig:
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) < parallel_config.world_size ({self.parallel_config.world_size})"
             )
+
+        # Resolve num_local_gpus given nnodes. Treat num_gpus as the
+        # *global* world size (across all nodes). num_local_gpus is how many
+        # GPUs this node uses — defaults to an even split.
+        if self.num_local_gpus is None:
+            if self.num_gpus % self.nnodes != 0:
+                raise ValueError(
+                    f"num_gpus ({self.num_gpus}) is not divisible by nnodes ({self.nnodes}); "
+                    "set num_local_gpus explicitly for uneven splits."
+                )
+            self.num_local_gpus = self.num_gpus // self.nnodes
+        if self.nnodes * self.num_local_gpus != self.num_gpus:
+            raise ValueError(
+                f"nnodes ({self.nnodes}) * num_local_gpus ({self.num_local_gpus}) "
+                f"!= num_gpus ({self.num_gpus})"
+            )
+        if not (0 <= self.node_rank < self.nnodes):
+            raise ValueError(f"node_rank={self.node_rank} out of range [0, {self.nnodes})")
 
         # Convert string dtype to torch.dtype if needed
         if isinstance(self.dtype, str):
@@ -725,6 +769,17 @@ class OmniDiffusionConfig:
             kwargs["quantization_config"] = kwargs.pop("quantization")
         else:
             kwargs.pop("quantization", None)
+
+        # CLI aliases: vLLM already registers --nnodes / --node-rank for its own
+        # multi-node semantics; diffusion uses dit-nnodes / dit-node-rank instead.
+        if "dit_nnodes" in kwargs:
+            kwargs["nnodes"] = kwargs.pop("dit_nnodes")
+        if "dit_node_rank" in kwargs:
+            kwargs["node_rank"] = kwargs.pop("dit_node_rank")
+        if "dit_num_local_gpus" in kwargs:
+            v = kwargs.pop("dit_num_local_gpus")
+            if v is not None:
+                kwargs["num_local_gpus"] = v
 
         # Check environment variable as fallback for cache_backend
         # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND for backwards compatibility
