@@ -877,6 +877,7 @@ class MareyFinalLayer(nn.Module):
 # ---------------------------------------------------------------------------
 # Main Transformer
 # ---------------------------------------------------------------------------
+have_logged = False
 class SPInputsWrap(nn.Module):
     """Prepares inputs to be sharded by _sp_plan
     """
@@ -897,6 +898,11 @@ class SPInputsWrap(nn.Module):
             temporal_pos: Temporal position embeddings
             spatial_pos_emb: Spatial position embeddings
         """
+        #Log shapes
+        global have_logged
+        if not have_logged:
+            logger.info(f"SPInputsWrap: x_hidden_states shape={x_hidden_states.shape}, temporal_pos shape={temporal_pos.shape}, spatial_pos_emb shape={spatial_pos_emb.shape}")
+            have_logged = True
         return x_hidden_states, temporal_pos, spatial_pos_emb
 class SPOutputWrap(nn.Module):
     """Wraps output to be gathered by _sp_plan
@@ -944,11 +950,11 @@ class MareyTransformer(nn.Module):
 
     _sp_plan = {
         "sp_inputs_wrap": {
-            0: SequenceParallelInput(split_dim=2, expected_dims=4, split_output=True),
-            1: SequenceParallelInput(split_dim=2, expected_dims=3, split_output=True),
-            2: SequenceParallelInput(split_dim=2, expected_dims=4, split_output=True),
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),
+            1: SequenceParallelInput(split_dim=1, expected_dims=2, split_output=True),
+            2: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),
         },
-        "sp_output_wrap": SequenceParallelOutput(gather_dim=2, expected_dims=4),
+        "sp_output_wrap": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
 
     def __init__(
@@ -1198,17 +1204,18 @@ class MareyTransformer(nn.Module):
         temporal_pos = get_temporal_pos(x, T, S)
 
         #Pass through SP wrapper for _sp_plan to auto shard them
-        temporal_pos = temporal_pos.reshape(temporal_pos.shape[0], T, S) # [B, T, S]
-        spatial_pos_emb_blocks = spatial_pos_emb_blocks.reshape(spatial_pos_emb.shape[0], T, S, -1) # [1, T, S, C]
 
-        x = x.reshape(B, T, S, -1) # [B, T, S, C]
-        x, temporal_pos, spatial_pos_emb_blocks = self.sp_inputs_wrap(x, temporal_pos, spatial_pos_emb_blocks)
-        S_new = x.shape[2]
-        S_full = S
-        S = S_new
-        x = x.reshape(B, T * S, -1)
-        temporal_pos = temporal_pos.reshape(temporal_pos.shape[0], T*S)
-        spatial_pos_emb_blocks = spatial_pos_emb_blocks.reshape(1, T*S, -1)
+        # temporal_pos = temporal_pos.reshape(temporal_pos.shape[0], T, S) # [B, T, S]
+        # spatial_pos_emb_blocks = spatial_pos_emb_blocks.reshape(spatial_pos_emb.shape[0], T, S, -1) # [1, T, S, C]
+        # x = x.reshape(B, T, S, -1) # [B, T, S, C]
+
+        x, temporal_pos, spatial_pos_emb_blocks = self.sp_inputs_wrap(x, temporal_pos, spatial_pos_emb_blocks) # Split spatiotemporal
+        # S_new = x.shape[2]
+        # S_full = S
+        # S = S_new
+        # x = x.reshape(B, T * S, -1)
+        # temporal_pos = temporal_pos.reshape(temporal_pos.shape[0], T*S)
+        # spatial_pos_emb_blocks = spatial_pos_emb_blocks.reshape(1, T*S, -1)
 
         if not self.add_pos_embed_at_every_block:
             spatial_pos_emb_blocks = None
@@ -1246,9 +1253,10 @@ class MareyTransformer(nn.Module):
 
         # Final layer
         x = self.final_layer(x, t_emb_final)
-        x = x.reshape(x.shape[0], T, S, -1)
+        # x = x.reshape(x.shape[0], T, S, -1)
         x = self.sp_output_wrap(x)
-        x = x.reshape(x.shape[0], T * S_full, -1)
+        # x = x.reshape(x.shape[0], T * S_full, -1)
+        # x = x.reshape(x.shape[0], T, S, -1)
         # Unpatchify
         x = self._unpatchify(x, T, H, W, hidden_states)
 
