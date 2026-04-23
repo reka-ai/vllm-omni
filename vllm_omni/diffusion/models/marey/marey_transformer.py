@@ -732,7 +732,13 @@ class MareyFluxBlock(nn.Module):
         self.hidden_size = hidden_size
         self.share_weights = share_weights
 
-        self.modulation_x = nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        self.modulation_x = ColumnParallelLinear(
+            hidden_size,
+            6 * hidden_size,
+            bias=True,
+            gather_output=True,
+            return_bias=False,
+        )
         self.norm1_x = LlamaRMSNorm(hidden_size)
         self.norm2_x = LlamaRMSNorm(hidden_size)
         self.mlp_x = SwiGLUFFN(hidden_size, int(hidden_size * mlp_ratio))
@@ -748,7 +754,13 @@ class MareyFluxBlock(nn.Module):
         )
 
         if not share_weights:
-            self.modulation_y = nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            self.modulation_y = ColumnParallelLinear(
+                hidden_size,
+                6 * hidden_size,
+                bias=True,
+                gather_output=True,
+                return_bias=False,
+            )
             self.norm1_y = LlamaRMSNorm(hidden_size)
             self.norm2_y = LlamaRMSNorm(hidden_size)
             self.mlp_y = SwiGLUFFN(hidden_size, int(hidden_size * mlp_ratio))
@@ -862,7 +874,13 @@ class MareyFinalLayer(nn.Module):
         self.linear = nn.Linear(hidden_size, num_patch * out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True),
+            ColumnParallelLinear(
+                hidden_size,
+                2 * hidden_size,
+                bias=True,
+                gather_output=True,
+                return_bias=False,
+            ),
         )
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
