@@ -46,6 +46,51 @@ def _load_te_config_from_model_dir(model_dir: str) -> dict:
     return full.get("text_encoder", {}) or {}
 
 
+def _shard_ul2_encoder(ul2_model: nn.Module, dtype: torch.dtype) -> None:
+    """FSDP-shard UL2's encoder across the stage's worker group.
+
+    Stage 0 does not initialise vllm_omni's ``_FS`` group, so we cannot
+    use ``apply_hsdp_to_model`` directly. Instead we build a device mesh
+    over the default torch.distributed world and call ``shard_model``.
+    Each worker must already have its local CUDA device selected (vLLM
+    does this in ``init_worker_distributed_environment``).
+    """
+    from torch.distributed import init_device_mesh
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+    from transformers.models.t5.modeling_t5 import T5Block
+
+    from vllm_omni.diffusion.distributed.hsdp import shard_model
+
+    world_size = torch.distributed.get_world_size()
+    mesh = init_device_mesh(
+        "cuda",
+        mesh_shape=(1, world_size),
+        mesh_dim_names=("replicate", "shard"),
+    )
+    logger.info("Mesh shape: %s, param_dtype: %s", mesh.shape, dtype)
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=dtype,
+        reduce_dtype=torch.float32,
+        cast_forward_inputs=False,
+    )
+
+    def _is_t5_block(name: str, module: nn.Module) -> bool:
+        return isinstance(module, T5Block)
+
+    shard_model(
+        ul2_model.encoder,
+        reshard_after_forward=True,
+        mp_policy=mp_policy,
+        mesh=mesh,
+        hsdp_shard_conditions=[_is_t5_block],
+    )
+    logger.info(
+        "FSDP-sharded UL2 encoder across %d ranks (world_size=%d)",
+        world_size,
+        world_size,
+    )
+
+
 class MareyTextEncoder(nn.Module):
     """Stage-0 Marey text encoder (UL2 + CLIP + ByT5).
 
@@ -92,21 +137,30 @@ class MareyTextEncoder(nn.Module):
         dtype = getattr(vllm_config.model_config, "dtype", None) or torch.bfloat16
         self.dtype = dtype
 
-        self._bundle: MareyTextEncoderBundle | None = None
-        self._loaded = False
+        # Build the bundle eagerly. vLLM wraps model construction in
+        # ``set_current_vllm_config(...)`` which any future TP layer would
+        # need. Weights land on CPU (``device_map="cpu"``); we either shard
+        # UL2 across all workers in this stage via FSDP or fall back to a
+        # plain ``.to(device)``.
+        device = vllm_config.device_config.device
+        logger.info("Loading Marey text encoders (ul2/clip/byt5) on %s", device)
+        self._bundle = MareyTextEncoderBundle(self.te_cfg, dtype=dtype)
 
-    # -- Lazy encoder load ---------------------------------------------------
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            _shard_ul2_encoder(self._bundle.ul2_model, dtype=dtype)
+            # CLIP + ByT5 stay replicated per worker (small, not worth
+            # sharding). Move them to the local GPU explicitly.
+            # self._bundle.clip_model.to(device)
+            self._bundle.clip_model.to(device)
+            _shard_ul2_encoder(self._bundle.byt5_model, dtype=dtype)
+            # self._bundle.byt5_model.to(device)
+        else:
+            self._bundle.to_device(device)
+
+        self._loaded = True
 
     def _ensure_loaded(self) -> MareyTextEncoderBundle:
-        if self._bundle is not None:
-            return self._bundle
-        device = self.vllm_config.device_config.device
-        logger.info("Loading Marey text encoders (ul2/clip/byt5) on %s", device)
-        bundle = MareyTextEncoderBundle(self.te_cfg, dtype=self.dtype)
-        bundle.to_device(device)
-        self._bundle = bundle
-        self._loaded = True
-        return bundle
+        return self._bundle
 
     # -- vLLM model interface ------------------------------------------------
 
@@ -121,9 +175,11 @@ class MareyTextEncoder(nn.Module):
         return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Encoder weights load from HF on the first forward pass.
+        # Bundle weights are loaded eagerly in __init__ from HF. Consume
+        # anything vLLM's loader feeds us and report every bundle parameter
+        # as initialised so the framework's coverage check passes.
         _ = list(weights)
-        return set()
+        return {name for name, _ in self.named_parameters()}
 
     # -- Encoding forward ----------------------------------------------------
 
@@ -212,6 +268,7 @@ class MareyTextEncoder(nn.Module):
 
         # ``multimodal_outputs`` is a dict of per-request lists; downstream
         # output processing iterates positionally across requests.
+        torch.cuda.empty_cache()
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs=by_key,

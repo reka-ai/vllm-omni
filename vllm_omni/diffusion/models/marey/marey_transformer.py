@@ -933,6 +933,10 @@ class SPOutputWrap(nn.Module):
         return x
 
 
+def _is_marey_block(name: str, module: nn.Module) -> bool:
+    return "blocks" in name and name.split(".")[-1].isdigit()
+
+
 class MareyTransformer(nn.Module):
     """Marey MMDiT Transformer for video diffusion.
 
@@ -974,6 +978,8 @@ class MareyTransformer(nn.Module):
         },
         "sp_output_wrap": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
+
+    _hsdp_shard_conditions = [_is_marey_block]
 
     def __init__(
         self,

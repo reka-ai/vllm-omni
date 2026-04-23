@@ -159,7 +159,8 @@ class MareyVaePipeline(nn.Module):
         if isinstance(output, tuple):
             output = output[0]
 
-
+        output = output.to("cpu")
+        torch.cuda.empty_cache()
         return DiffusionOutput(output=output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

@@ -14,7 +14,7 @@ stage_args:
   - stage_id: 0
     stage_type: llm
     runtime:
-      devices: "0"
+      devices: "0,1,2,3,4,5,6,7"
       max_batch_size: 1
     engine_args:
       model_stage: text_encoder
@@ -43,8 +43,8 @@ stage_args:
       trust_remote_code: true
       distributed_executor_backend: "mp"
       enable_prefix_caching: false
-      tensor_parallel_size: 1
-      gpu_memory_utilization: 0.15
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.005
       # Must stay ≤ google/ul2's n_positions (512). vLLM's tokenization
       # path is irrelevant here — MareyTextEncoder ignores the token IDs.
       max_num_batched_tokens: 512
@@ -73,6 +73,8 @@ stage_args:
       distributed_executor_backend: "mp"
       parallel_config:
         ulysses_degree: 8
+        use_hsdp: true
+        hsdp_shard_size: 8
     engine_input_source: [0]
     final_output: false
     is_comprehension: false

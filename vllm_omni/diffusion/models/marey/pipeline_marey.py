@@ -434,6 +434,7 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
 
         device = self.device
         dtype = self.transformer.dtype
+        logger.info(f"MareyTransformer dtype: {dtype}")
 
         generator = sp.generator
         if generator is None and sp.seed is not None:
@@ -634,6 +635,8 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
         # in ``custom_output`` so ``stage_input_processors.marey.diffusion2vae``
         # reads it from ``source_output._custom_output`` with the other
         # size metadata.
+        z = z.to("cpu")
+        torch.cuda.empty_cache()
         return DiffusionOutput(
             output=z,
             custom_output={
