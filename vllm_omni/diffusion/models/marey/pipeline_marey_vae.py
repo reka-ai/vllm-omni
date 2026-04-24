@@ -90,7 +90,7 @@ class MareyVaePipeline(nn.Module):
     def _dummy_latent(self, height: int, width: int, num_frames: int) -> torch.Tensor:
         t_ds = self.vae_scale_factor_temporal
         s_ds = self.vae_scale_factor_spatial
-        channels = int(getattr(self.vae, "out_channels", 16))
+        channels = int(getattr(self.vae, "latent_embed_dim", 16))
         lat_t = max(1, (num_frames + t_ds - 1) // t_ds)
         lat_h = max(1, (height + s_ds - 1) // s_ds)
         lat_w = max(1, (width + s_ds - 1) // s_ds)
@@ -164,9 +164,9 @@ class MareyVaePipeline(nn.Module):
         return DiffusionOutput(output=output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # VAE weights are loaded inside load_vae() via the opensora
-        # PretrainedSpatioTemporalVAETokenizer. The ``weights`` iterator is
-        # irrelevant here — return all parameter names so the framework
-        # considers the load successful.
+        # VAE weights are loaded inside load_vae() via
+        # wlam.models.vae.two_stage_vae.TwoStageVAE.load_from_checkpoint —
+        # the ``weights`` iterator is irrelevant here. Return all parameter
+        # names so the framework considers the load successful.
         _ = list(weights)
         return {name for name, _ in self.named_parameters()}

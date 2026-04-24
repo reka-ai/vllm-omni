@@ -39,6 +39,8 @@ class DiffRow:
     max_abs: float
     mean_abs: float
     p99_abs: float
+    max_rel: float
+    mean_rel: float
     is_close: bool
     note: str = ""
 
@@ -65,6 +67,8 @@ def _tensor_stats(a: torch.Tensor, b: torch.Tensor, atol: float, rtol: float) ->
             max_abs=float("inf"),
             mean_abs=float("inf"),
             p99_abs=float("inf"),
+            max_rel=float("inf"),
+            mean_rel=float("inf"),
             is_close=False,
             note="shape mismatch",
         )
@@ -78,6 +82,16 @@ def _tensor_stats(a: torch.Tensor, b: torch.Tensor, atol: float, rtol: float) ->
     else:
         flat_sampled = flat
     p99 = float(flat_sampled.quantile(0.99)) if flat_sampled.numel() > 0 else 0.0
+    # Relative diff: |a-b| / mean(|a|, |b|); ignore positions where both are 0.
+    denom = (af.abs() + bf.abs()) * 0.5
+    mask = denom > 0
+    if mask.any():
+        rel = diff[mask] / denom[mask]
+        max_rel = float(rel.max())
+        mean_rel = float(rel.mean())
+    else:
+        max_rel = 0.0
+        mean_rel = 0.0
     close = torch.allclose(af, bf, atol=atol, rtol=rtol)
     return DiffRow(
         rel_path="",
@@ -89,6 +103,8 @@ def _tensor_stats(a: torch.Tensor, b: torch.Tensor, atol: float, rtol: float) ->
         max_abs=float(diff.max()) if diff.numel() > 0 else 0.0,
         mean_abs=float(diff.mean()) if diff.numel() > 0 else 0.0,
         p99_abs=p99,
+        max_rel=max_rel,
+        mean_rel=mean_rel,
         is_close=bool(close),
     )
 
@@ -128,6 +144,8 @@ def compare_dumps(
                     max_abs=float("inf"),
                     mean_abs=float("inf"),
                     p99_abs=float("inf"),
+                    max_rel=float("inf"),
+                    mean_rel=float("inf"),
                     is_close=False,
                     note=f"load error: {type(e).__name__}: {e}",
                 )
@@ -145,6 +163,8 @@ def compare_dumps(
                     max_abs=float("inf"),
                     mean_abs=float("inf"),
                     p99_abs=float("inf"),
+                    max_rel=float("inf"),
+                    mean_rel=float("inf"),
                     is_close=False,
                     note="non-tensor payload",
                 )
@@ -161,7 +181,10 @@ def compare_dumps(
 def _format_table(rows: list[DiffRow]) -> str:
     if not rows:
         return "(no common tensors)\n"
-    header = f"{'close':<6}{'max_abs':>12}{'mean_abs':>12}{'p99_abs':>12}  {'shape':<24}{'dtype a/b':<20}path"
+    header = (
+        f"{'close':<6}{'max_abs':>12}{'mean_abs':>12}{'p99_abs':>12}"
+        f"{'max_rel':>12}{'mean_rel':>12}  {'shape':<24}{'dtype a/b':<20}path"
+    )
     lines = [header, "-" * len(header)]
     for r in rows:
         close_mark = "OK" if r.is_close else "FAIL"
@@ -172,6 +195,8 @@ def _format_table(rows: list[DiffRow]) -> str:
             f"{r.max_abs:12.4g}"
             f"{r.mean_abs:12.4g}"
             f"{r.p99_abs:12.4g}"
+            f"{r.max_rel:12.4g}"
+            f"{r.mean_rel:12.4g}"
             f"  {shape_s:<24}{dtype_s:<20}{r.rel_path}"
         )
         if r.note:
@@ -193,11 +218,15 @@ def _format_summary(rows: list[DiffRow]) -> str:
     cat_lines = []
     for cat, cat_rows in sorted(by_category.items()):
         max_abs = max((r.max_abs for r in cat_rows), default=0.0)
+        max_rel = max((r.max_rel for r in cat_rows), default=0.0)
         fail = sum(1 for r in cat_rows if not r.is_close)
-        cat_lines.append(f"  {cat:<24} n={len(cat_rows):<5} fail={fail:<4} max_abs={max_abs:.4g}")
+        cat_lines.append(
+            f"  {cat:<24} n={len(cat_rows):<5} fail={fail:<4} "
+            f"max_abs={max_abs:.4g} max_rel={max_rel:.4g}"
+        )
     return (
         f"{passed} close, {failed} fail (of {len(rows)} tensors)\n"
-        f"worst: max_abs={worst.max_abs:.4g} at {worst.rel_path}\n"
+        f"worst: max_abs={worst.max_abs:.4g} max_rel={worst.max_rel:.4g} at {worst.rel_path}\n"
         "by category:\n"
         + "\n".join(cat_lines)
         + "\n"

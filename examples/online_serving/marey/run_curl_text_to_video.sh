@@ -10,13 +10,14 @@ BASE_URL="${BASE_URL:-http://localhost:8098}"
 POLL_INTERVAL="${POLL_INTERVAL:-5}"
 SEED="${SEED:-0}"
 OUTPUT_PATH="${OUTPUT_PATH:-marey_stages_${SEED}.mp4}"
+NSTEPS="${NSTEPS:-33}"
 create_response=$(
   curl -sS -X POST "${BASE_URL}/v1/videos" \
     -H "Accept: application/json" \
     -F "prompt=Detailed Description: A majestic, aged eagle with mottled golden-brown feathers soars gracefully through a vast, ancient indoor chamber covered in magic runes, glowing mysteriously. Its expansive wings flap fast, catching the air as it glides effortlessly between towering stone pillars adorned with glinting metallic accents. Beams of morning light pierce the gloom, filtering through a cracked skylight high above and illuminating swirling dust motes in their path. The camera pans smoothly, following the eagle's silent flight as it navigates the cavernous space, its sharp eyes scanning the stone floor below, creating a scene of serene power and timeless solitude. Background: The far reaches of the chamber fade into deep shadow, with the silhouettes of distant pillars barely visible. High above, a cracked skylight serves as the primary light source, its fractured glass creating distinct rays of light. Middleground: The aged eagle glides on a steady path, its mottled golden-brown wings spread wide. It passes through the dramatic beams of light, which highlight the intricate details of its feathers and the dust particles dancing in the air. Foreground: The camera looks up from a low angle, tracking the eagle's movement across the expansive stone floor, which is patterned with the bright shafts of light and deep shadows cast by the pillars." \
     -F "size=1920x1080" \
     -F "num_frames=128" \
-    -F "num_inference_steps=4" \
+    -F "num_inference_steps=${NSTEPS}" \
     -F "guidance_scale=3.5" \
     -F "seed=${SEED}"
 )
