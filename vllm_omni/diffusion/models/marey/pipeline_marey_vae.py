@@ -21,7 +21,10 @@ from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.models.marey.vae_loader import load_vae
+from vllm_omni.diffusion.models.marey.vae_loader import (
+    build_marey_vae_sp_hooks,
+    load_vae,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = logging.getLogger(__name__)
@@ -76,21 +79,17 @@ class MareyVaePipeline(nn.Module):
         self.dtype = getattr(od_config, "dtype", torch.bfloat16)
 
         vae_cfg = _resolve_vae_config(od_config)
-        # Load on CPU first; we move to GPU per-forward to stay consistent
-        # with the rest of vllm-omni's diffusion stages (which own their GPU
-        # memory for the duration of a request).
+
         self.vae, self.vae_init_error = load_vae(vae_cfg, "cpu", self.dtype)
         if self.vae is None:
             raise RuntimeError(f"MareyVaePipeline failed to load VAE: {self.vae_init_error}")
         self.vae.to(self.device)
-        ds = tuple(vae_cfg.get("downsample_factors", (4, 16, 16)))
-        self.vae_scale_factor_temporal = ds[0]
-        self.vae_scale_factor_spatial = ds[1]
+        self.sp_shard, self.sp_gather = build_marey_vae_sp_hooks()
 
     def _dummy_latent(self, height: int, width: int, num_frames: int) -> torch.Tensor:
-        t_ds = self.vae_scale_factor_temporal
-        s_ds = self.vae_scale_factor_spatial
-        channels = int(getattr(self.vae, "latent_embed_dim", 16))
+        t_ds = self.vae.model.get_downsample_factors(0)[0]
+        s_ds = self.vae.model.get_downsample_factors(0)[1]
+        channels = int(getattr(self.vae.model, "latent_embed_dim", 16))
         lat_t = max(1, (num_frames + t_ds - 1) // t_ds)
         lat_h = max(1, (height + s_ds - 1) // s_ds)
         lat_w = max(1, (width + s_ds - 1) // s_ds)
@@ -119,13 +118,12 @@ class MareyVaePipeline(nn.Module):
 
         z = add_info.get("latents")
         if z is None:
-            # Fallback: the stage input processor may have stashed the latent
-            # on sampling_params.latents instead.
+            logger.info(f"No latents found in additional_information, using sampling_params.latents")
             z = req.sampling_params.latents
 
         height = add_info.get("height") or req.sampling_params.height or 720
         width = add_info.get("width") or req.sampling_params.width or 1280
-        num_frames_req = add_info.get("num_frames") or req.sampling_params.num_frames or 33
+        num_frames_req = add_info.get("num_frames") or req.sampling_params.num_frames or 128
 
         if z is None:
             # Warmup / dummy run: the diffusion engine's _dummy_run sends an
@@ -133,6 +131,7 @@ class MareyVaePipeline(nn.Module):
             # zero-filled latent of the expected shape so the VAE still
             # touches its full decode path.
             z = self._dummy_latent(int(height), int(width), int(num_frames_req))
+            logger.info(f"Dummy latent shape: {z.shape}")
 
         z = z.to(device=self.device, dtype=self.dtype)
 
@@ -141,21 +140,26 @@ class MareyVaePipeline(nn.Module):
         if output_type == "latent":
             return DiffusionOutput(output=z)
 
-        vae_t_ds = self.vae.downsample_factors[0]
+        vae_t_ds = self.vae.model.get_downsample_factors(0)[0]
         num_latent_t = z.shape[2]
         num_pixel_frames = num_latent_t * vae_t_ds
-        chunk = self.vae.frame_chunk_len
+        chunk = self.vae.cfg.frame_chunk_len
         if num_latent_t <= 1:
             num_pixel_frames = 1
         elif chunk is not None and num_pixel_frames % chunk != 0:
             num_pixel_frames = (num_pixel_frames // chunk) * chunk
 
+        
+        logger.info(f'Starting VAE decode with shape: {z.shape}')
         with torch.no_grad():
             output = self.vae.decode(
                 z,
                 num_frames=num_pixel_frames,
                 spatial_size=(int(height), int(width)),
+                sp_shard=self.sp_shard,
+                sp_gather=self.sp_gather,
             )
+        logger.info(f'VAE decode completed with shape: {output[0].shape}')
         if isinstance(output, tuple):
             output = output[0]
 

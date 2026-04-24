@@ -3,10 +3,11 @@
 
 """Loader for the Marey spatiotemporal VAE, backed by ``wlam.models.vae``.
 
-Re-uses wlam's :class:`TwoStageVAEInference` wrapper (chunking, scaling/bias,
-overlap-and-drop decode, per-stage ``max_batch_size``) and injects
-sequence-parallel sharding via the ``sp_shard`` / ``sp_gather`` hooks wlam
-exposes inside its ``_encode`` / ``_decode``.
+Returns a :class:`wlam.models.vae.vae_inference.TwoStageVAEInference` directly
+(chunking, scaling/bias, overlap-and-drop decode, per-stage ``max_batch_size``).
+Sequence-parallel sharding is plumbed by the consumer via the ``sp_shard`` /
+``sp_gather`` hooks that wlam's ``_encode`` / ``_decode`` expose — see
+:func:`build_marey_vae_sp_hooks`.
 
 We only depend on ``wlam.models.vae.*`` — its imports (``torch``, ``einops``,
 ``diffusers``) are already in vllm-omni, so this is a light dependency. If
@@ -60,14 +61,15 @@ def _ensure_wlam_importable() -> None:
     )
 
 
-def _build_sp_hooks() -> tuple[
+def build_marey_vae_sp_hooks() -> tuple[
     Callable[[torch.Tensor], torch.Tensor] | None,
     Callable[[torch.Tensor], torch.Tensor] | None,
 ]:
     """Build ``(sp_shard, sp_gather)`` callables over vllm-omni's SP group.
 
-    Each pair shares a closure so the pad_size produced by the shard call
-    can be consumed by the matching gather.
+    Returns ``(None, None)`` when SP is disabled. The returned pair shares a
+    closure so the pad_size produced by ``sp_shard`` is consumed by the
+    matching ``sp_gather``.
     """
     from vllm_omni.diffusion.distributed.parallel_state import (
         get_sequence_parallel_world_size,
@@ -98,85 +100,6 @@ def _build_sp_hooks() -> tuple[
     return sp_shard, sp_gather
 
 
-class MareyWlamVAE(nn.Module):
-    """Thin adapter over wlam's :class:`TwoStageVAEInference`.
-
-    Surfaces the handful of attributes the Marey pipeline reads
-    (``latent_embed_dim``, ``downsample_factors``, ``frame_chunk_len``) and
-    wires SP sharding through wlam's ``sp_shard`` / ``sp_gather`` hooks.
-    """
-
-    def __init__(
-        self,
-        inference: nn.Module,  # wlam.models.vae.vae_inference.TwoStageVAEInference
-        *,
-        enable_sequence_parallelism: bool = False,
-    ) -> None:
-        super().__init__()
-        self.inference = inference
-        self.enable_sequence_parallelism = enable_sequence_parallelism
-
-    # ---- surface used by the Marey pipeline --------------------------------
-
-    @property
-    def model(self) -> nn.Module:
-        return self.inference.model
-
-    @property
-    def latent_embed_dim(self) -> int:
-        return int(self.model.latent_embed_dim)
-
-    @property
-    def downsample_factors(self) -> tuple[int, int, int]:
-        print(f"MareyWlamVAE downsample_factors: {self.model.get_downsample_factors(0)}")
-        return tuple(self.model.get_downsample_factors(0))  # type: ignore[return-value]
-
-    @property
-    def frame_chunk_len(self) -> int:
-        return int(self.inference.cfg.frame_chunk_len)
-
-    # ---- SP hooks ----------------------------------------------------------
-
-    def _sp_hooks(
-        self,
-    ) -> tuple[
-        Callable[[torch.Tensor], torch.Tensor] | None,
-        Callable[[torch.Tensor], torch.Tensor] | None,
-    ]:
-        if not self.enable_sequence_parallelism:
-            return None, None
-        return _build_sp_hooks()
-
-    # ---- encode / decode (pass-through with SP hooks) ----------------------
-
-    def encode(
-        self,
-        x: torch.Tensor,
-        compression: tuple[int, int, int] | None = None,
-    ) -> torch.Tensor:
-        sp_shard, sp_gather = self._sp_hooks()
-        return self.inference.encode(
-            x, compression=compression, sp_shard=sp_shard, sp_gather=sp_gather
-        )
-
-    def decode(
-        self,
-        z: torch.Tensor,
-        num_frames: int | None = None,
-        spatial_size: tuple[int, int] | None = None,
-        expansion: tuple[int, int, int] | None = None,
-    ) -> torch.Tensor:
-        sp_shard, sp_gather = self._sp_hooks()
-        return self.inference.decode(
-            z,
-            num_frames=num_frames,
-            spatial_size=spatial_size,
-            expansion=expansion,
-            sp_shard=sp_shard,
-            sp_gather=sp_gather,
-        )
-
-
 def load_vae(
     vae_config: dict[str, Any],
     device: torch.device | str,
@@ -185,62 +108,46 @@ def load_vae(
     """Load the Marey spatiotemporal VAE using ``wlam.models.vae``.
 
     Returns ``(vae_module, error_msg)``. ``error_msg`` is None on success.
+    On success ``vae_module`` is a ``TwoStageVAEInference`` moved to
+    ``device`` / ``dtype`` and set to ``eval()``.
     """
     vae_path = vae_config.get("cp_path", "")
     if not os.path.exists(vae_path):
         return None, f"VAE checkpoint not found at {vae_path}."
 
-    try:
-        _ensure_wlam_importable()
-        from wlam.models.vae.two_stage_vae import TwoStageVAE
-        from wlam.models.vae.vae_inference import TwoStageVAEInferenceConfig
+    _ensure_wlam_importable()
+    from wlam.models.vae.vae_inference import TwoStageVAEInferenceConfig
 
-        from vllm_omni.diffusion.distributed.parallel_state import (
-            get_sequence_parallel_world_size,
-        )
-        enable_sequence_parallelism = get_sequence_parallel_world_size() > 1
-        logger.info(f"[VAE] enable_sequence_parallelism: {enable_sequence_parallelism}")
+    decode_chunking_strategy = (
+        "overlap-and-drop"
+        if vae_config.get("extra_context_and_drop_strategy", False)
+        else "basic"
+    )
 
-        # Pre-load on CPU so we can honour the Marey config's non-strict flag
-        # (``TwoStageVAEInferenceConfig`` would otherwise call load with
-        # ``strict=True`` when given a path).
+    max_batch_size = 8
+    inference = TwoStageVAEInferenceConfig(
+        checkpoint=vae_path,
+        frame_chunk_len=vae_config["frame_chunk_len"],
+        decode_chunking_strategy=decode_chunking_strategy,
+        scaling_factor=vae_config.get("scaling_factor", 1.0),
+        bias_factor=vae_config.get("bias_factor", 0.0),
+        max_batch_size=max_batch_size,
+        torch_compile_kwargs={
+            'dynamic': False,
+            'fullgraph': True,
+            'mode': 'default',
+        },
+    ).make()
 
-        decode_chunking_strategy = (
-            "overlap-and-drop"
-            if vae_config.get("extra_context_and_drop_strategy", False)
-            else "basic"
-        )
-
-        max_batch_size = 16
-        inference = TwoStageVAEInferenceConfig(
-            checkpoint=vae_path,
-            frame_chunk_len=vae_config["frame_chunk_len"],
-            decode_chunking_strategy=decode_chunking_strategy,
-            scaling_factor=vae_config.get("scaling_factor", 1.0),
-            bias_factor=vae_config.get("bias_factor", 0.0),
-            max_batch_size=max_batch_size,
-            torch_compile_kwargs={
-                'dynamic': False,
-                'fullgraph': True,
-                'mode':'default',
-            }
-        ).make()
-
-        vae = MareyWlamVAE(
-            inference,
-            enable_sequence_parallelism=enable_sequence_parallelism,
-        )
-        vae = vae.to(device, dtype).eval()
-        logger.info(
-            "Loaded wlam Marey VAE (latent_embed_dim=%s, downsample=%s) from %s. Frame chunk len: %s, max batch size: %s, decode chunking strategy: %s",
-            vae.latent_embed_dim,
-            vae.downsample_factors,
-            vae_path,
-            vae.frame_chunk_len,
-            max_batch_size,
-            decode_chunking_strategy,
-        )
-        return vae, None
-    except Exception as e:
-        raise e
-        return None, f"Could not load Marey VAE from {vae_path}: {type(e).__name__}: {e}"
+    inference = inference.to(device, dtype).eval()
+    logger.info(
+        "Loaded wlam Marey VAE (latent_embed_dim=%s, downsample=%s) from %s. "
+        "Frame chunk len: %s, max batch size: %s, decode chunking strategy: %s",
+        inference.model.latent_embed_dim,
+        inference.model.get_downsample_factors(0),
+        vae_path,
+        inference.cfg.frame_chunk_len,
+        max_batch_size,
+        decode_chunking_strategy,
+    )
+    return inference, None
