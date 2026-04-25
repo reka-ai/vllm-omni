@@ -821,6 +821,9 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         )
         self._num_timesteps = len(timesteps)
 
+        if hasattr(self, "_dump_timesteps"):
+            self._dump_timesteps(timesteps)
+
         # -- Guidance schedule ------------------------------------------------
         guidance_schedule: list[float] | None = None
         if use_cfg:
@@ -944,6 +947,9 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                 pbar.update()
 
         self._current_timestep = None
+
+        if hasattr(self, "_dump_final_latent"):
+            self._dump_final_latent(z)
 
         # -- VAE decode -------------------------------------------------------
         self.transformer.to("cpu")

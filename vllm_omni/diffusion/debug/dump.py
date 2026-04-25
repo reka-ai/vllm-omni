@@ -16,9 +16,20 @@ The mixin assumes the pipeline class follows the convention introduced in
 
 Activation: any of these env vars set will engage the mixin:
 
-  - ``MAREY_DUMP_DIR``           — root dir; per-request subdir created on each forward()
-  - ``MAREY_LOAD_INITIAL_NOISE`` — path to a .pt file with the initial noise tensor
-  - ``MAREY_LOAD_STEP_NOISE_DIR``— dir containing ``step_noise_<i>.pt`` files
+  - ``MAREY_DUMP_DIR``                   — root dir; per-request subdir created on each forward()
+  - ``MAREY_LOAD_INITIAL_NOISE``         — path to a .pt file with the initial noise tensor
+  - ``MAREY_LOAD_STEP_NOISE_DIR``        — dir containing ``step_noise_<i>.pt`` files
+  - ``MAREY_LOAD_TEXT_EMBEDS_DIR``       — dir containing ``encode_{cond,uncond}_*.pt`` from a
+                                           reference run; substitutes text-encoder outputs
+  - ``MAREY_LOAD_TRANSFORMER_INPUTS_DIR``— dir containing ``step<i>_<label>_*.pt`` from a
+                                           reference run; substitutes every per-step transformer
+                                           input (hidden_states, timestep, encoder_hidden_states,
+                                           vector_cond, extra_features) via a forward pre-hook
+  - ``MAREY_DUMP_BLOCKS_AT_STEPS``       — comma-separated step indices at which to dump every
+                                           DiT block's (x, y) output as
+                                           ``step<i>_<label>_block<b>_{x,y}_out.pt``. Default
+                                           unset (no block dumping). Use ``"0"`` for step-0-only
+                                           localization of transformer forward divergence.
 
 If none are set, the mixin is inert (no overhead, no behavior change).
 
@@ -74,6 +85,16 @@ class DumpMixin:
         self._load_step_noise_dir: str | None = (
             os.environ.get("MAREY_LOAD_STEP_NOISE_DIR") or None
         )
+        self._load_text_embeds_dir: str | None = (
+            os.environ.get("MAREY_LOAD_TEXT_EMBEDS_DIR") or None
+        )
+        self._load_transformer_inputs_dir: str | None = (
+            os.environ.get("MAREY_LOAD_TRANSFORMER_INPUTS_DIR") or None
+        )
+        _dump_blocks_env = os.environ.get("MAREY_DUMP_BLOCKS_AT_STEPS", "")
+        self._dump_blocks_at_steps: set[int] = {
+            int(s) for s in _dump_blocks_env.split(",") if s.strip().isdigit()
+        }
 
         # Only rank 0 dumps. After SP all-gather every rank holds the same
         # tensors, so dumping from all 8 produces 8 copies. Loading still
@@ -89,6 +110,8 @@ class DumpMixin:
             self._dump_dir_root
             or self._load_initial_noise_path
             or self._load_step_noise_dir
+            or self._load_text_embeds_dir
+            or self._load_transformer_inputs_dir
         )
         self._current_dump_dir: str | None = None
 
@@ -100,15 +123,22 @@ class DumpMixin:
         self._cond_text_id: int | None = None
         self._uncond_text_id: int | None = None
         self._encode_prompt_call_count: int = 0
+        # Label resolved by the pre-hook; consumed by the post-hook of the
+        # same call. At L1, the pre-hook replaces encoder_hidden_states so the
+        # post-hook can no longer match by id() — this cache bridges them.
+        self._pending_call_label: str | None = None
 
         if not self._active:
             return
 
         logger.warning(
-            "DumpMixin active: dump_dir=%s load_initial=%s load_step_dir=%s",
+            "DumpMixin active: dump_dir=%s load_initial=%s load_step_dir=%s "
+            "load_text_embeds_dir=%s load_transformer_inputs_dir=%s",
             self._dump_dir_root,
             self._load_initial_noise_path,
             self._load_step_noise_dir,
+            self._load_text_embeds_dir,
+            self._load_transformer_inputs_dir,
         )
 
         # Wrap encode_prompt so we capture text encoder outputs without
@@ -117,10 +147,31 @@ class DumpMixin:
         self.encode_prompt = self._wrapped_encode_prompt  # type: ignore[method-assign]
 
         # Capture every transformer forward call (cond + uncond per step).
+        # Pre-hook is always registered so the label stash works even when the
+        # MAREY_LOAD_TRANSFORMER_INPUTS_DIR env var isn't set (post-hook reads
+        # the stash first, falls back to id-matching on the current ehs).
         if hasattr(self, "transformer") and self.transformer is not None:
+            self.transformer.register_forward_pre_hook(
+                self._transformer_forward_pre_hook, with_kwargs=True
+            )
             self.transformer.register_forward_hook(
                 self._transformer_forward_hook, with_kwargs=True
             )
+            # Optional per-DiT-block output capture at specified steps.
+            # Block input/output is (x, y); dump as
+            # step<i>_<label>_block<b>_{x,y}_{in,out}.pt.
+            if self._dump_blocks_at_steps and hasattr(self.transformer, "blocks"):
+                logger.warning(
+                    "DumpMixin per-block dump enabled at steps %s",
+                    sorted(self._dump_blocks_at_steps),
+                )
+                for block_idx, block in enumerate(self.transformer.blocks):
+                    block.register_forward_pre_hook(
+                        self._make_block_pre_hook(block_idx), with_kwargs=True
+                    )
+                    block.register_forward_hook(
+                        self._make_block_hook(block_idx), with_kwargs=True
+                    )
 
     # -- forward() wrapper: set up per-request dump dir ---------------------
 
@@ -138,6 +189,7 @@ class DumpMixin:
         self._cond_text_id = None
         self._uncond_text_id = None
         self._encode_prompt_call_count = 0
+        self._pending_call_label = None
         try:
             return super().forward(req)  # type: ignore[misc]
         finally:
@@ -235,6 +287,14 @@ class DumpMixin:
             self._encode_prompt_call_count += 1
             return result
 
+        # Substitute reference text-encoder outputs BEFORE id-caching so
+        # the identity that flows into the transformer matches what we cache.
+        if self._load_text_embeds_dir:
+            seq_cond, seq_cond_masks, vector_cond = self._load_text_embeds(
+                label, seq_cond, seq_cond_masks, vector_cond
+            )
+            result = (seq_cond, seq_cond_masks, vector_cond)
+
         # Cache identity of the first sequence tensor so the transformer
         # hook can later identify cond vs uncond by tensor identity.
         first_seq = seq_cond[0] if isinstance(seq_cond, (list, tuple)) else seq_cond
@@ -263,6 +323,71 @@ class DumpMixin:
         self._encode_prompt_call_count += 1
         return result
 
+    def _load_text_embeds(
+        self,
+        label: str,
+        seq_cond: Any,
+        seq_cond_masks: Any,
+        vector_cond: Any,
+    ) -> tuple[Any, Any, Any]:
+        """Substitute reference ``encode_<label>_*`` tensors into the return."""
+        assert self._load_text_embeds_dir
+        base = self._load_text_embeds_dir
+
+        def _load_if_exists(path: str, ref: torch.Tensor) -> torch.Tensor:
+            if not os.path.exists(path):
+                logger.warning("DumpMixin text-embed: %s absent, keeping vllm-omni value", path)
+                return ref
+            loaded = torch.load(path, map_location=ref.device).to(
+                device=ref.device, dtype=ref.dtype
+            )
+            if tuple(loaded.shape) != tuple(ref.shape):
+                logger.warning(
+                    "DumpMixin SKIPPING text-embed %s: shape %s != ref %s",
+                    path, tuple(loaded.shape), tuple(ref.shape),
+                )
+                return ref
+            return loaded
+
+        if isinstance(seq_cond, (list, tuple)):
+            new_seq = type(seq_cond)(
+                _load_if_exists(
+                    os.path.join(base, f"encode_{label}_seq_cond_{j}.pt"), t
+                ) if t is not None else t
+                for j, t in enumerate(seq_cond)
+            )
+        elif seq_cond is not None:
+            new_seq = _load_if_exists(
+                os.path.join(base, f"encode_{label}_seq_cond.pt"), seq_cond
+            )
+        else:
+            new_seq = seq_cond
+
+        if isinstance(seq_cond_masks, (list, tuple)):
+            new_masks = type(seq_cond_masks)(
+                _load_if_exists(
+                    os.path.join(base, f"encode_{label}_seq_mask_{j}.pt"), t
+                ) if t is not None else t
+                for j, t in enumerate(seq_cond_masks)
+            )
+        elif seq_cond_masks is not None:
+            new_masks = _load_if_exists(
+                os.path.join(base, f"encode_{label}_seq_mask.pt"), seq_cond_masks
+            )
+        else:
+            new_masks = seq_cond_masks
+
+        if vector_cond is not None:
+            # mv emits vector_cond_0; vllm-omni emits vector_cond — try both.
+            vc_path = os.path.join(base, f"encode_{label}_vector_cond_0.pt")
+            if not os.path.exists(vc_path):
+                vc_path = os.path.join(base, f"encode_{label}_vector_cond.pt")
+            new_vc = _load_if_exists(vc_path, vector_cond)
+        else:
+            new_vc = vector_cond
+
+        return new_seq, new_masks, new_vc
+
     # -- transformer forward hook: capture per-call IO ----------------------
 
     def _identify_call(self, encoder_hidden_states: Any) -> str:
@@ -287,6 +412,121 @@ class DumpMixin:
             return "uncond"
         return "unknown"
 
+    def _transformer_forward_pre_hook(
+        self,
+        module: torch.nn.Module,
+        args: tuple,
+        kwargs: dict,
+    ) -> tuple[tuple, dict]:
+        """Substitute every per-step transformer input from a reference dump.
+
+        Engaged only when ``MAREY_LOAD_TRANSFORMER_INPUTS_DIR`` is set. Runs
+        BEFORE the forward call; the post-hook then sees (and dumps) the
+        injected tensors, which is desirable — per-step dumps should reflect
+        what the transformer actually consumed.
+
+        Also stashes the resolved cond/uncond label into
+        ``self._pending_call_label`` so the post-hook dumps with the correct
+        label even though it now sees the replaced ``encoder_hidden_states``.
+        """
+        del module
+        ehs = kwargs.get("encoder_hidden_states")
+        label = self._identify_call(ehs)
+        # Stash so the post-hook can reuse it regardless of whether we inject.
+        self._pending_call_label = label
+
+        if not self._load_transformer_inputs_dir:
+            return args, kwargs
+        if label == "unknown":
+            # Warmup/profile pass — don't inject.
+            return args, kwargs
+
+        base = self._load_transformer_inputs_dir
+        prefix = f"step{self._current_step}_{label}"
+        new_kwargs = dict(kwargs)
+        new_args = list(args)
+
+        def _load_and_replace(path: str, ref: torch.Tensor) -> torch.Tensor:
+            if not os.path.exists(path):
+                return ref
+            loaded = torch.load(path, map_location=ref.device).to(
+                device=ref.device, dtype=ref.dtype
+            )
+            if tuple(loaded.shape) != tuple(ref.shape):
+                logger.warning(
+                    "DumpMixin SKIPPING transformer-input %s: shape %s != ref %s",
+                    path, tuple(loaded.shape), tuple(ref.shape),
+                )
+                return ref
+            return loaded
+
+        hs_ref = new_args[0] if new_args else new_kwargs.get("hidden_states")
+        if hs_ref is not None:
+            hs_new = _load_and_replace(
+                os.path.join(base, f"{prefix}_hidden_states.pt"), hs_ref
+            )
+            if new_args:
+                new_args[0] = hs_new
+            else:
+                new_kwargs["hidden_states"] = hs_new
+
+        ts_ref = new_kwargs.get("timestep")
+        if ts_ref is not None:
+            new_kwargs["timestep"] = _load_and_replace(
+                os.path.join(base, f"{prefix}_timestep.pt"), ts_ref
+            )
+
+        vc_ref = new_kwargs.get("vector_cond")
+        if vc_ref is not None:
+            # mv: vector_cond_0.pt; vllm-omni: vector_cond.pt.
+            vc_path = os.path.join(base, f"{prefix}_vector_cond_0.pt")
+            if not os.path.exists(vc_path):
+                vc_path = os.path.join(base, f"{prefix}_vector_cond.pt")
+            new_kwargs["vector_cond"] = _load_and_replace(vc_path, vc_ref)
+
+        ehs_ref = new_kwargs.get("encoder_hidden_states")
+        if isinstance(ehs_ref, (list, tuple)):
+            new_kwargs["encoder_hidden_states"] = type(ehs_ref)(
+                _load_and_replace(
+                    os.path.join(base, f"{prefix}_encoder_hidden_states_{j}.pt"), t
+                ) if t is not None else t
+                for j, t in enumerate(ehs_ref)
+            )
+        elif ehs_ref is not None:
+            new_kwargs["encoder_hidden_states"] = _load_and_replace(
+                os.path.join(base, f"{prefix}_encoder_hidden_states.pt"), ehs_ref
+            )
+
+        ef_ref = new_kwargs.get("extra_features")
+        if isinstance(ef_ref, dict):
+            new_ef = {}
+            for k, v in ef_ref.items():
+                if v is None:
+                    new_ef[k] = v
+                    continue
+                # mv names as kw_<k>, vllm-omni names as extra_<k>.
+                mv_path = os.path.join(base, f"{prefix}_kw_{k}.pt")
+                path = mv_path if os.path.exists(mv_path) else os.path.join(
+                    base, f"{prefix}_extra_{k}.pt"
+                )
+                new_ef[k] = _load_and_replace(path, v)
+            new_kwargs["extra_features"] = new_ef
+
+        # height/width/fps/num_frames are separate kwargs on vllm-omni's
+        # transformer but appear as extra_features entries on mv (dumped as
+        # kw_<name> via fallthrough). Inject same way.
+        for k in ("height", "width", "fps", "num_frames"):
+            v = new_kwargs.get(k)
+            if v is None:
+                continue
+            mv_path = os.path.join(base, f"{prefix}_kw_{k}.pt")
+            path = mv_path if os.path.exists(mv_path) else os.path.join(
+                base, f"{prefix}_extra_{k}.pt"
+            )
+            new_kwargs[k] = _load_and_replace(path, v)
+
+        return tuple(new_args), new_kwargs
+
     def _transformer_forward_hook(
         self,
         module: torch.nn.Module,
@@ -295,11 +535,18 @@ class DumpMixin:
         output: Any,
     ) -> None:
         del module
+        # Pre-hook stashed the label (it sees the ORIGINAL encoder_hidden_states
+        # before any injection replaces it). Consume + clear. Fall back to
+        # id-matching on current kwargs only if the stash is missing (shouldn't
+        # happen unless someone skips the pre-hook path).
+        label = self._pending_call_label
+        self._pending_call_label = None
+        if label is None:
+            label = self._identify_call(kwargs.get("encoder_hidden_states"))
+
         if not self._current_dump_dir:
             return
 
-        ehs = kwargs.get("encoder_hidden_states")
-        label = self._identify_call(ehs)
         prefix = f"step{self._current_step}_{label}"
 
         # Inputs
@@ -310,6 +557,7 @@ class DumpMixin:
             v = kwargs.get(k)
             if v is not None:
                 self._dump(f"{prefix}_{k}", v)
+        ehs = kwargs.get("encoder_hidden_states")
         if isinstance(ehs, (list, tuple)):
             for j, t in enumerate(ehs):
                 if t is not None:
@@ -321,11 +569,89 @@ class DumpMixin:
             for k, t in ef.items():
                 if t is not None:
                     self._dump(f"{prefix}_extra_{k}", t)
+        # vllm-omni passes height/width/fps as separate transformer kwargs
+        # (not inside extra_features). mv dumps them as kw_<name> via its
+        # generic fallthrough. Dump them under the same `extra_` bucket so
+        # the canonical_name normalization in compare_dumps.py pairs them.
+        for k in ("height", "width", "fps", "num_frames"):
+            v = kwargs.get(k)
+            if v is not None:
+                self._dump(f"{prefix}_extra_{k}", v)
         # Output (v_pred). The pipeline calls with return_dict=False, so output
         # is a tuple whose first element is the predicted velocity.
         v_pred = output[0] if isinstance(output, tuple) else getattr(output, "sample", output)
         if v_pred is not None:
             self._dump(f"{prefix}_v_pred", v_pred)
+
+    # -- per-DiT-block output hook (optional, step-gated) -------------------
+
+    def _make_block_hook(self, block_idx: int):
+        """Factory for a forward hook that dumps a single block's (x, y) output
+        at the steps listed in ``MAREY_DUMP_BLOCKS_AT_STEPS``.
+
+        The label (cond/uncond) is read from ``self._pending_call_label`` which
+        was stashed by the transformer pre-hook earlier in the same forward.
+        """
+        def _hook(module, args, kwargs, output):
+            del module, args, kwargs
+            if not self._current_dump_dir:
+                return
+            if self._current_step not in self._dump_blocks_at_steps:
+                return
+            label = self._pending_call_label or "unknown"
+            prefix = f"step{self._current_step}_{label}_block{block_idx}"
+            if isinstance(output, tuple) and len(output) >= 2:
+                if output[0] is not None:
+                    self._dump(f"{prefix}_x_out", output[0])
+                if output[1] is not None:
+                    self._dump(f"{prefix}_y_out", output[1])
+            elif isinstance(output, torch.Tensor):
+                self._dump(f"{prefix}_out", output)
+        return _hook
+
+    def _make_block_pre_hook(self, block_idx: int):
+        """Factory for a forward pre-hook that dumps the block's INPUT (x, y)
+        at the steps listed in ``MAREY_DUMP_BLOCKS_AT_STEPS``. Useful to
+        check per-rank shard alignment between codebases.
+        """
+        def _hook(module, args, kwargs):
+            del module
+            if not self._current_dump_dir:
+                return
+            if self._current_step not in self._dump_blocks_at_steps:
+                return
+            label = self._pending_call_label or "unknown"
+            prefix = f"step{self._current_step}_{label}_block{block_idx}"
+            # MareyFluxBlock signature: forward(self, x, y, t_x, t_y, ...).
+            # Args order: (x, y, t_x, t_y, ...). May come as args or kwargs.
+            x_in = args[0] if len(args) > 0 else kwargs.get("x")
+            y_in = args[1] if len(args) > 1 else kwargs.get("y")
+            if x_in is not None:
+                self._dump(f"{prefix}_x_in", x_in)
+            if y_in is not None:
+                self._dump(f"{prefix}_y_in", y_in)
+        return _hook
+
+    # -- final-latent hook (called by pipeline just before VAE decode) ------
+
+    def _dump_final_latent(self, z: torch.Tensor) -> None:
+        """Capture the final pre-VAE latent as ``z_final.pt``."""
+        if self._current_dump_dir:
+            self._dump("z_final", z)
+
+    def _dump_timesteps(self, timesteps: Any) -> None:
+        """Capture the 1-D sampling schedule as ``timesteps.pt``.
+
+        Accepts a single 1-D tensor or a list of scalar/1-element tensors
+        (vllm-omni builds timesteps as the latter).
+        """
+        if not self._current_dump_dir:
+            return
+        if isinstance(timesteps, (list, tuple)):
+            t = torch.cat([x.flatten() for x in timesteps])
+        else:
+            t = timesteps
+        self._dump("timesteps", t)
 
     # -- dump helper --------------------------------------------------------
 

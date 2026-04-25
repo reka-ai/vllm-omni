@@ -103,26 +103,22 @@ def _diff_tensors(a: torch.Tensor, b: torch.Tensor, name: str) -> TensorDiff:
 # ---------------------------------------------------------------------------
 
 
-_STEP_PAT = re.compile(r"_(\d+)(?:_|$|\.)")
+_STEP_I_PAT = re.compile(r"^step(\d+)_(cond|uncond)_(.+)$")
 
 
 def _step_index(name: str) -> int | None:
-    """Extract a step or call index from a tensor basename, if present.
+    """Extract a step index from a tensor basename, if present.
 
     Recognised patterns:
-        step_noise_<i>     -> i
-        trans<i>_*         -> i (transformer call index)
-        encode<i>_*        -> i (encode_prompt call index, conceptually a step)
+        step_noise_<i>             -> i
+        step<i>_<label>_<field>    -> i
     """
     if name.startswith("step_noise_"):
         try:
             return int(name[len("step_noise_"):])
         except ValueError:
             return None
-    m = re.match(r"trans(\d+)_", name)
-    if m:
-        return int(m.group(1))
-    m = re.match(r"encode(\d+)_", name)
+    m = _STEP_I_PAT.match(name)
     if m:
         return int(m.group(1))
     return None
@@ -131,25 +127,39 @@ def _step_index(name: str) -> int | None:
 def _category(name: str) -> str:
     if name == "z_initial":
         return "z_initial"
+    if name == "z_final":
+        return "z_final"
+    if name == "timesteps":
+        return "timesteps_schedule"
     if name.startswith("step_noise_"):
         return "step_noise"
-    if name.startswith("encode") and "_seq_cond" in name:
-        return "text_seq_cond"
-    if name.startswith("encode") and "_seq_mask" in name:
-        return "text_seq_mask"
-    if name.startswith("encode") and "_vector_cond" in name:
-        return "text_vector_cond"
-    if name.startswith("trans") and "_v_pred" in name:
-        return "transformer_v_pred"
-    if name.startswith("trans") and "_model_out" in name:
-        return "transformer_v_pred"
-    if name.startswith("trans") and "_hidden_states" in name:
-        return "transformer_hidden_states"
-    if name.startswith("trans") and "_timestep" in name:
-        return "transformer_timestep"
-    if name.startswith("trans") and "_extra_" in name:
-        return "transformer_extra"
-    if name.startswith("trans"):
+    # Text encoder outputs: encode_<label>_<field>[_<j>]
+    if name.startswith("encode_"):
+        if "_seq_cond" in name:
+            return "text_seq_cond"
+        if "_seq_mask" in name:
+            return "text_seq_mask"
+        if "_vector_cond" in name:
+            return "text_vector_cond"
+        return "text_misc"
+    # Per-step transformer I/O: step<i>_<label>_<field>
+    m = _STEP_I_PAT.match(name)
+    if m:
+        tail = m.group(3)
+        if tail == "hidden_states":
+            return "transformer_hidden_states"
+        if tail == "timestep":
+            return "transformer_timestep"
+        if tail == "v_pred" or tail == "model_out":
+            return "transformer_v_pred"
+        if tail.startswith("encoder_hidden_states"):
+            return "transformer_encoder_hidden_states"
+        if tail.startswith("vector_cond"):
+            return "transformer_vector_cond"
+        # Normalize extra_features: mv wrapper dumps as kw_<k>,
+        # vllm-omni DumpMixin dumps as extra_<k>. Same bucket.
+        if tail.startswith("extra_") or tail.startswith("kw_"):
+            return "transformer_extra"
         return "transformer_misc"
     return "other"
 
@@ -159,14 +169,33 @@ def _category(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+_KW_EXTRA_PAT = re.compile(r"^(step\d+_(?:cond|uncond)_)kw_(.+)$")
+
+
+def _canonical_name(name: str) -> str:
+    """Canonicalize across mv / vllm-omni naming for cross-codebase diff.
+
+    - ``step<i>_<label>_kw_<key>`` (mv fallthrough) → ``step<i>_<label>_extra_<key>``
+      (vllm-omni DumpMixin's name for ``extra_features`` dict entries).
+    - ``latents`` (mv's ``--save-latents`` output) → ``z_final`` (vllm-omni's
+      DumpMixin name for the pre-VAE final latent).
+    """
+    if name == "latents":
+        return "z_final"
+    m = _KW_EXTRA_PAT.match(name)
+    if m:
+        return f"{m.group(1)}extra_{m.group(2)}"
+    return name
+
+
 def _list_dump(path: str) -> dict[str, str]:
-    """Map basename (without .pt) → full path for every .pt file in dir."""
+    """Map canonical basename (without .pt) → full path for every .pt file."""
     out = {}
     if not os.path.isdir(path):
         raise SystemExit(f"Dump dir not found: {path}")
     for fname in sorted(os.listdir(path)):
         if fname.endswith(".pt"):
-            out[fname[:-3]] = os.path.join(path, fname)
+            out[_canonical_name(fname[:-3])] = os.path.join(path, fname)
     return out
 
 
@@ -214,17 +243,38 @@ def main() -> int:
     p.add_argument("--b", type=str, help="Second dump dir (e.g. vllm-omni)")
     p.add_argument("--self-test", type=str, default=None, metavar="DIR",
                    help="Diff a dump dir against itself; expects all-zero diffs.")
+    p.add_argument("--list-categories", type=str, default=None, metavar="DIR",
+                   help="List category counts for a single dump dir; no diff.")
     p.add_argument("--show-all", action="store_true",
                    help="Print every tensor (default: only summary + worst-N per category)")
     p.add_argument("--worst-n", type=int, default=5,
                    help="Per-category, show the N tensors with largest relative diff (default 5)")
     args = p.parse_args()
 
+    if args.list_categories:
+        files = _list_dump(args.list_categories)
+        by_cat: dict[str, int] = defaultdict(int)
+        examples: dict[str, list[str]] = defaultdict(list)
+        for name in files:
+            cat = _category(name)
+            by_cat[cat] += 1
+            if len(examples[cat]) < 2:
+                examples[cat].append(name)
+        print(f"Categories in {args.list_categories}  ({len(files)} tensors):")
+        print(f"  {'category':<35}  {'count':>6}   examples")
+        for cat in sorted(by_cat, key=lambda c: (-by_cat[c], c)):
+            ex = ", ".join(examples[cat])
+            print(f"  {cat:<35}  {by_cat[cat]:>6}   {ex}")
+        if by_cat.get("other", 0) > 0:
+            print(f"\n!! {by_cat['other']} tensor(s) fell into 'other' — classifier needs a new branch.")
+            return 1
+        return 0
+
     if args.self_test:
         a_path = b_path = args.self_test
     else:
         if not args.a or not args.b:
-            p.error("--a and --b are required (or use --self-test)")
+            p.error("--a and --b are required (or use --self-test / --list-categories)")
         a_path, b_path = args.a, args.b
 
     a_files = _list_dump(a_path)

@@ -60,6 +60,9 @@ env_args=(
 [[ -n "${MAREY_DUMP_DIR:-}" ]]                && env_args+=("MAREY_DUMP_DIR=${MAREY_DUMP_DIR}")
 [[ -n "${MAREY_LOAD_INITIAL_NOISE:-}" ]]      && env_args+=("MAREY_LOAD_INITIAL_NOISE=${MAREY_LOAD_INITIAL_NOISE}")
 [[ -n "${MAREY_LOAD_STEP_NOISE_DIR:-}" ]]     && env_args+=("MAREY_LOAD_STEP_NOISE_DIR=${MAREY_LOAD_STEP_NOISE_DIR}")
+[[ -n "${MAREY_LOAD_TEXT_EMBEDS_DIR:-}" ]]    && env_args+=("MAREY_LOAD_TEXT_EMBEDS_DIR=${MAREY_LOAD_TEXT_EMBEDS_DIR}")
+[[ -n "${MAREY_LOAD_TRANSFORMER_INPUTS_DIR:-}" ]] && env_args+=("MAREY_LOAD_TRANSFORMER_INPUTS_DIR=${MAREY_LOAD_TRANSFORMER_INPUTS_DIR}")
+[[ -n "${MAREY_DUMP_BLOCKS_AT_STEPS:-}" ]]    && env_args+=("MAREY_DUMP_BLOCKS_AT_STEPS=${MAREY_DUMP_BLOCKS_AT_STEPS}")
 
 # Pipeline class selector: defaults to MareyPipeline. Set to DumpMareyPipeline
 # (registered in vllm_omni/diffusion/registry.py) to enable instrumentation.
