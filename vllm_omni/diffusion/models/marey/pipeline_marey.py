@@ -401,6 +401,8 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
             logger.info("[marey-timing] stage=dit forward end request_id=%s elapsed=%.3fs", req.request_id, _elapsed)
 
     def _forward_impl(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+
+        torch.cuda.empty_cache()
         if len(req.prompts) != 1:
             raise ValueError("MareyDitPipeline only supports a single prompt per request.")
 
@@ -419,17 +421,18 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
         # `additional_information`. Fabricate zero-filled encoder tensors of
         # the expected shape so the warmup executes the full transformer path.
         if prompt_embeds is None or vector_cond is None:
+            logger.info("No prompt_embeds or vector_cond in request, building dummy encoder tensors")
             prompt_embeds, prompt_masks, vector_cond = self._dummy_encoder_tensors()
         negative_prompt_embeds = add_info.get("neg_prompt_embeds")
         negative_prompt_masks = add_info.get("neg_prompt_masks")
         negative_vector_cond = add_info.get("neg_vector_cond")
 
         sp = req.sampling_params
-        height = sp.height or 720
-        width = sp.width or 1280
-        num_frames = sp.num_frames if sp.num_frames else 33
-        num_steps = sp.num_inference_steps or 100
-        guidance_scale = sp.guidance_scale if sp.guidance_scale_provided else 7.5
+        height = sp.height
+        width = sp.width
+        num_frames = sp.num_frames
+        num_steps = sp.num_inference_steps
+        guidance_scale = sp.guidance_scale if sp.guidance_scale_provided else 3.5
         self._guidance_scale = guidance_scale
 
         device = self.device
@@ -629,14 +632,16 @@ class MareyDitPipeline(nn.Module, ProgressBarMixin):
         if dumper.enabled:
             dumper.write_final(z)
 
-        # Stage output: final latents. The diffusion engine stores
-        # ``DiffusionOutput.output`` on the downstream ``OmniRequestOutput``
-        # as ``.images``, but ``.latents`` stays unset. Stash the latent
-        # in ``custom_output`` so ``stage_input_processors.marey.diffusion2vae``
-        # reads it from ``source_output._custom_output`` with the other
-        # size metadata.
-        z = z.to("cpu")
-        torch.cuda.empty_cache()
+        # Inter-stage payload lives in ``custom_output``: the VAE stage
+        # reads the latent + size metadata from
+        # ``source_output._custom_output`` via
+        # ``stage_input_processors.marey.diffusion2vae``.
+        #
+        # ``output=z`` is *not* a second data path — it's the engine's
+        # "non-empty result" sentinel. ``DiffusionEngine.step`` early-returns
+        # an empty ``OmniRequestOutput`` (and crucially drops
+        # ``custom_output``) when ``output.output is None``, so we have to
+        # populate it for the inter-stage handoff to fire.
         return DiffusionOutput(
             output=z,
             custom_output={

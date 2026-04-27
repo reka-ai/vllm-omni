@@ -126,32 +126,21 @@ def diffusion2vae(
 ) -> list[dict[str, Any]]:
     """Build the VAE stage prompt from the DiT stage output.
 
-    Stage 1 stores the final latent tensor on ``OmniRequestOutput.latents``
-    and size metadata on ``_custom_output`` (populated from
-    ``DiffusionOutput.custom_output`` by the diffusion engine).
+    Stage 1 stashes the denoised latent + size metadata in
+    ``DiffusionOutput.custom_output``, which the diffusion engine forwards
+    to ``OmniRequestOutput._custom_output``. That dict is the sole inter-
+    stage channel — we read everything from it.
     """
     source_outputs = _get_source_outputs(stage_list, engine_input_source)
 
     built: list[dict[str, Any]] = []
     for source_output in source_outputs:
-        # Stage 1 stashes the denoised latent + size metadata in
-        # ``custom_output`` (populated from ``DiffusionOutput.custom_output``
-        # by the diffusion engine). ``OmniRequestOutput.latents`` stays
-        # unset because the engine routes ``DiffusionOutput.output`` into
-        # ``.images`` for diffusion stages.
-        custom = getattr(source_output, "_custom_output", None) or {}
+        custom = source_output._custom_output or {}
         latents = custom.get("latents")
-        if latents is None:
-            # Fall back to whatever the engine left on the request output.
-            latents = getattr(source_output, "latents", None)
-        if latents is None:
-            images = getattr(source_output, "images", None)
-            if isinstance(images, list) and images:
-                latents = images[0]
         if latents is None:
             raise RuntimeError(
                 f"Stage-1 output for req {getattr(source_output, 'request_id', '?')} "
-                "has no latents tensor."
+                "has no latents tensor in _custom_output."
             )
 
         height = custom.get("height")
