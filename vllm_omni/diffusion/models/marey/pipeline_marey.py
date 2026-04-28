@@ -434,42 +434,99 @@ def get_marey_post_process_func(od_config: OmniDiffusionConfig):
 
 
 def get_marey_pre_process_func(od_config: OmniDiffusionConfig):
-    """Optional pre-process for I2V: load and resize input image."""
+    """Pre-process conditioning images for Marey I2V.
+
+    Mirrors mv `marey_inference.py:_frame_conditions` (lines 230-297): for each
+    conditioning image, letterbox-resize via ``ImageOps.fit`` to the target
+    resolution, ``to_tensor``, then ``Normalize(mean=[0.5], std=[0.5])`` to land
+    in ``[-1, 1]``. Stack into ``(1, C, T_keyframes, H, W)``. Store along with
+    the parallel list of frame indices in ``additional_information`` for the
+    pipeline's forward to pick up.
+    """
     import numpy as np
     import PIL.Image
-    from diffusers.video_processor import VideoProcessor
+    from PIL import ImageOps
+    from torchvision import transforms
 
-    video_processor = VideoProcessor(vae_scale_factor=8)
+    def _infer_target_size(image: PIL.Image.Image) -> tuple[int, int]:
+        max_area = 720 * 1280
+        aspect_ratio = image.height / image.width
+        mod_value = 16
+        height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+        width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+        return int(width), int(height)
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
             if isinstance(prompt, str):
                 from vllm_omni.inputs.data import OmniTextPrompt
                 prompt = OmniTextPrompt(prompt=prompt)
             if "additional_information" not in prompt:
                 prompt["additional_information"] = {}
-            if raw_image is None:
-                continue
-            image = PIL.Image.open(raw_image).convert("RGB") if isinstance(raw_image, str) else raw_image
+
+            multi_modal_data = prompt.get("multi_modal_data", {})
+            raw_images = multi_modal_data.get("images")
+            raw_frame_indices = multi_modal_data.get("frame_indices")
+
+            # Back-compat: fall back to a single-image request via ``image`` key.
+            if not raw_images:
+                raw_image = multi_modal_data.get("image")
+                if raw_image is None:
+                    request.prompts[i] = prompt
+                    continue
+                raw_images = [raw_image]
+                if raw_frame_indices is None:
+                    raw_frame_indices = [0]
+
+            if raw_frame_indices is None or len(raw_frame_indices) != len(raw_images):
+                raise ValueError(
+                    f"Marey I2V preprocessing: expected frame_indices with the same length as images "
+                    f"(got {len(raw_frame_indices) if raw_frame_indices is not None else 'None'} indices "
+                    f"for {len(raw_images)} images)."
+                )
+
+            # Load and pick a target (W, H) from the first image if not provided.
+            pil_images = [
+                PIL.Image.open(img).convert("RGB") if isinstance(img, str) else img.convert("RGB")
+                for img in raw_images
+            ]
             if request.sampling_params.height is None or request.sampling_params.width is None:
-                max_area = 720 * 1280
-                aspect_ratio = image.height / image.width
-                mod_value = 16
-                height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-                width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+                w, h = _infer_target_size(pil_images[0])
                 if request.sampling_params.height is None:
-                    request.sampling_params.height = height
+                    request.sampling_params.height = h
                 if request.sampling_params.width is None:
-                    request.sampling_params.width = width
-            image = image.resize(
-                (request.sampling_params.width, request.sampling_params.height),
-                PIL.Image.Resampling.LANCZOS,
-            )
-            prompt["multi_modal_data"]["image"] = image
-            prompt["additional_information"]["preprocessed_image"] = video_processor.preprocess(
-                image, height=request.sampling_params.height, width=request.sampling_params.width
+                    request.sampling_params.width = w
+            target_w = int(request.sampling_params.width)
+            target_h = int(request.sampling_params.height)
+
+            # Letterbox-fit to match mv (marey_inference.py:284-286).
+            fitted = [ImageOps.fit(img, size=(target_w, target_h)) for img in pil_images]
+            tensors = [transforms.functional.to_tensor(img) for img in fitted]
+            normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            tensors = [normalize(t) for t in tensors]
+            cond_images = torch.stack(tensors, dim=1).unsqueeze(0)  # (1, C, T_keyframes, H, W) in [-1, 1]
+
+            # Reject dense keyframe groups (consecutive runs of 4 starting at idx%4==0)
+            # which would need the deferred split_vae_blocks_and_frames VAE-block path
+            # (mv marey_inference.py:63-95). Phase 2 only implements the individual-frame path.
+            sorted_idx = sorted(int(x) for x in raw_frame_indices)
+            for k in range(len(sorted_idx) - 3):
+                run = sorted_idx[k:k + 4]
+                if run[0] % 4 == 0 and run == list(range(run[0], run[0] + 4)):
+                    raise NotImplementedError(
+                        f"Dense keyframe group {run} requires the VAE-block encoding path, "
+                        f"which is not implemented yet. Use sparse keyframes (e.g. every 4+ frames)."
+                    )
+
+            prompt["multi_modal_data"]["images"] = fitted
+            prompt["multi_modal_data"]["image"] = fitted[0]  # back-compat alias
+            prompt["multi_modal_data"]["frame_indices"] = [int(x) for x in raw_frame_indices]
+            prompt["additional_information"]["cond_images"] = cond_images
+            prompt["additional_information"]["cond_frame_indices"] = [int(x) for x in raw_frame_indices]
+            logger.info(
+                "Marey I2V preprocess: cond_images.shape=%s cond_frame_indices=%s",
+                tuple(cond_images.shape),
+                prompt["additional_information"]["cond_frame_indices"],
             )
             request.prompts[i] = prompt
         return request
@@ -728,6 +785,61 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         shape = (batch_size, num_channels_latents, num_latent_frames, latent_h, latent_w)
         return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
 
+    # -- Conditioning-frame encoding (I2V) -----------------------------------
+
+    def _encode_cond_frames(
+        self,
+        cond_images: torch.Tensor,
+        cond_frame_indices: list[int],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode I2V conditioning images → ``cond_frames`` latent + ``cond_offsets``.
+
+        Mirrors mv ``marey_inference.py:_encode_images`` (lines 617-639) with
+        ``encode_as_images=True, clip_as_keyframes=True`` and the per-keyframe
+        offset loop at lines 330-341. Only the individual-frame path; dense
+        VAE-block keyframe groups are rejected earlier in the preprocess hook.
+
+        Args:
+            cond_images: ``(1, C=3, T_keyframes, H, W)`` in ``[-1, 1]``.
+            cond_frame_indices: List of target frame indices in the output video.
+
+        Returns:
+            ``(cond_frames, cond_offsets)`` — ``cond_frames`` shaped
+            ``(1, C_vae, T_keyframes, H_lat, W_lat)`` in transformer ``dtype``;
+            ``cond_offsets`` a 1-D int64 tensor of length ``T_keyframes``.
+        """
+        from einops import rearrange
+
+        if self.vae is None:
+            raise MareyVAEInitializationError(
+                build_request_missing_vae_error(self.vae_init_error, "cond_frames (I2V requires VAE)")
+            )
+
+        model_cfg = self.config.get("model", {})
+        latent_time_offset = model_cfg.get("latent_time_offset", -0.75)
+
+        # (1, C, T_kf, H, W) → (T_kf, C, 1, H, W): VAE treats each keyframe independently.
+        x = cond_images.to(device=device, dtype=dtype)
+        T_kf = x.shape[2]
+        x = rearrange(x, "B C (Tl L) H W -> (B Tl) C L H W", L=1)
+
+        with torch.no_grad():
+            enc = self.vae.encode_images(x)  # (T_kf, C_vae, 1, H_lat, W_lat)
+        enc = enc.squeeze(2)
+        cond_frames = rearrange(enc, "(B T) C H W -> B C T H W", T=T_kf).contiguous().to(dtype=dtype)
+
+        indices_tensor = torch.tensor(cond_frame_indices, device=device, dtype=torch.int64)
+        cond_offsets = self.vae.idx2offset(
+            indices_tensor,
+            latent_time_offset,
+            encode_as_images=True,
+            clip_as_keyframes=True,
+        )
+        return cond_frames, cond_offsets
+
     # -- Forward (DDPM flow-matching loop) -----------------------------------
 
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
@@ -785,6 +897,28 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         self.clip_model.to("cpu")
         self.byt5_model.to("cpu")
         torch.cuda.empty_cache()
+
+        # -- I2V: encode conditioning frames (VAE only, transformer still offloaded) --
+        cond_frames: torch.Tensor | None = None
+        cond_offsets: torch.Tensor | None = None
+        additional_information = (
+            raw_prompt.get("additional_information", {}) if not isinstance(raw_prompt, str) else {}
+        )
+        cond_images = additional_information.get("cond_images")
+        cond_frame_indices = additional_information.get("cond_frame_indices")
+        if cond_images is not None and cond_frame_indices:
+            self.vae.to(device)
+            cond_frames, cond_offsets = self._encode_cond_frames(
+                cond_images, cond_frame_indices, device=device, dtype=dtype,
+            )
+            self.vae.to("cpu")
+            torch.cuda.empty_cache()
+            logger.info(
+                "Marey I2V forward: cond_frames.shape=%s cond_offsets=%s",
+                tuple(cond_frames.shape),
+                cond_offsets.tolist(),
+            )
+
         self.transformer.to(device)
 
         # -- Timesteps --------------------------------------------------------
@@ -864,6 +998,8 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                 width=width_t,
                 fps=fps_t,
                 extra_features=ef if ef is not None else extra_features,
+                cond_frames=cond_frames,
+                cond_offsets=cond_offsets,
                 return_dict=False,
             )[0]
             if raw.shape[1] != in_channels:
