@@ -57,6 +57,42 @@ def t2i_modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> t
     return x * (1 + scale) + shift
 
 
+def t2i_modulate_masked(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    shift_t0: torch.Tensor | None = None,
+    scale_t0: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Mask-aware ``t2i_modulate`` for I2V.
+
+    Positions where ``mask`` is True (noise frames) use ``(shift, scale)`` from
+    ``t_emb``; positions where ``mask`` is False (conditioning frames) use the
+    ``t0`` variant so conditioning tokens are modulated as if ``timestep=0``.
+    Mirrors mv ``open_sora/opensora/models/stdit/dit3d.py:1165-1170``.
+    """
+    out = t2i_modulate(x, shift, scale)
+    if mask is not None and shift_t0 is not None and scale_t0 is not None:
+        out_t0 = t2i_modulate(x, shift_t0, scale_t0)
+        out = torch.where(mask, out, out_t0)
+    return out
+
+
+def gate_masked(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    gate_t0: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Mask-aware gate for I2V. Mirrors mv ``dit3d.py:1173-1177``."""
+    out = x * gate
+    if mask is not None and gate_t0 is not None:
+        out_t0 = x * gate_t0
+        out = torch.where(mask, out, out_t0)
+    return out
+
+
 def get_temporal_pos(
     x: torch.Tensor,
     T: int,
@@ -723,6 +759,8 @@ class MareyFluxBlock(nn.Module):
         temporal_pos: torch.Tensor | None = None,
         y_temporal_pos: torch.Tensor | None = None,
         spatial_pos_emb: torch.Tensor | None = None,
+        x_t_mask: torch.Tensor | None = None,
+        t0_x: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.share_weights:
             norm1_y, norm2_y = self.norm1_x, self.norm2_x
@@ -745,6 +783,20 @@ class MareyFluxBlock(nn.Module):
             modulation_y(t_y).unsqueeze(1).chunk(6, dim=-1)
         )
 
+        # I2V: compute t0-modulation params for the x-branch (y-branch unused).
+        # Reuses the same ``self.modulation_x`` Linear — no extra weights.
+        shift_msa_t0_x = scale_msa_t0_x = gate_msa_t0_x = None
+        shift_mlp_t0_x = scale_mlp_t0_x = gate_mlp_t0_x = None
+        if t0_x is not None:
+            (
+                shift_msa_t0_x,
+                scale_msa_t0_x,
+                gate_msa_t0_x,
+                shift_mlp_t0_x,
+                scale_mlp_t0_x,
+                gate_mlp_t0_x,
+            ) = self.modulation_x(t0_x).unsqueeze(1).chunk(6, dim=-1)
+
         _bd = getattr(self, '_block_diag', False)
         if _bd:
             logger.info(
@@ -757,8 +809,11 @@ class MareyFluxBlock(nn.Module):
                 f"gate_mlp={gate_mlp_x.float().mean():.4f}/{gate_mlp_x.float().std():.4f}"
             )
 
-        # Pre-attention: norm + modulate
-        x_m = t2i_modulate(self.norm1_x(x), shift_msa_x, scale_msa_x)
+        # Pre-attention: norm + modulate (x-branch is mask-aware in I2V)
+        x_m = t2i_modulate_masked(
+            self.norm1_x(x), shift_msa_x, scale_msa_x,
+            mask=x_t_mask, shift_t0=shift_msa_t0_x, scale_t0=scale_msa_t0_x,
+        )
         y_m = t2i_modulate(norm1_y(y), shift_msa_y, scale_msa_y)
 
         if _bd:
@@ -776,8 +831,8 @@ class MareyFluxBlock(nn.Module):
                 f"y_attn std={y_attn.float().std():.4f}"
             )
 
-        # Gate + residual (attention)
-        x = x + x_attn * gate_msa_x
+        # Gate + residual (attention). x-branch: mask-aware gate.
+        x = x + gate_masked(x_attn, gate_msa_x, mask=x_t_mask, gate_t0=gate_msa_t0_x)
         y = y + y_attn * gate_msa_y
 
         if _bd:
@@ -787,7 +842,10 @@ class MareyFluxBlock(nn.Module):
             )
 
         # MLP: norm + modulate + MLP + gate + residual
-        x_m = t2i_modulate(self.norm2_x(x), shift_mlp_x, scale_mlp_x)
+        x_m = t2i_modulate_masked(
+            self.norm2_x(x), shift_mlp_x, scale_mlp_x,
+            mask=x_t_mask, shift_t0=shift_mlp_t0_x, scale_t0=scale_mlp_t0_x,
+        )
         y_m = t2i_modulate(norm2_y(y), shift_mlp_y, scale_mlp_y)
         mlp_out_x = self.mlp_x(x_m)
         mlp_out_y = mlp_y(y_m)
@@ -798,7 +856,7 @@ class MareyFluxBlock(nn.Module):
                 f"gated_mlp std={(mlp_out_x * gate_mlp_x).float().std():.4f}"
             )
 
-        x = x + mlp_out_x * gate_mlp_x
+        x = x + gate_masked(mlp_out_x, gate_mlp_x, mask=x_t_mask, gate_t0=gate_mlp_t0_x)
         y = y + mlp_out_y * gate_mlp_y
 
         return x, y
@@ -1055,6 +1113,8 @@ class MareyTransformer(nn.Module):
         width: torch.Tensor | None = None,
         fps: torch.Tensor | None = None,
         extra_features: dict[str, torch.Tensor] | None = None,
+        cond_frames: torch.Tensor | None = None,
+        cond_offsets: torch.Tensor | None = None,
         return_dict: bool = True,
     ) -> torch.Tensor | Transformer2DModelOutput:
         """
@@ -1067,6 +1127,13 @@ class MareyTransformer(nn.Module):
             height: Video height [B] (for position embedding scaling).
             width: Video width [B].
             fps: Frames per second [B] (for FPS conditioning).
+            cond_frames: (I2V) Conditioning latents [B, C, Tf, H, W]. When provided,
+                these are patch-embedded and concatenated onto ``hidden_states``
+                along the temporal axis; the appended positions are modulated as
+                ``timestep=0`` via ``t0_emb`` and have their RoPE temporal positions
+                set by ``cond_offsets`` so the model sees them at their true target
+                frame locations. Mirrors mv ``dit3d.py:1020-1043``.
+            cond_offsets: (I2V) Per-keyframe latent-time offsets of shape [Tf].
         """
         dtype = self.x_embedder.proj.weight.dtype
         B = hidden_states.size(0)
@@ -1126,6 +1193,14 @@ class MareyTransformer(nn.Module):
         t_mlp = self.t_block(t_emb)  # [B, hidden_size]
         t_emb_final = t_emb
 
+        # I2V: precompute the ``timestep=0`` path so cond-frame tokens can be
+        # modulated with t0 inside the blocks. Same ``t_embedder`` / ``t_block``
+        # weights (zero new params). Mirrors mv ``dit3d.py:1008``.
+        t0_mlp: torch.Tensor | None = None
+        if cond_frames is not None:
+            t0_emb = self.t_embedder(torch.zeros_like(timestep), dtype=dtype) + vec_cond
+            t0_mlp = self.t_block(t0_emb)
+
         if _diag:
             logger.info(
                 f"DIAG t_emb: mean={t_emb.float().mean():.4f} std={t_emb.float().std():.4f} "
@@ -1137,6 +1212,32 @@ class MareyTransformer(nn.Module):
         x = x.reshape(B, T, S, -1)
         if not self.add_pos_embed_at_every_block:
             x = x + spatial_pos_emb
+
+        # I2V: embed conditioning frames the same way and concat along T.
+        # Mirrors mv ``dit3d.py:1018-1043`` (cond_frames_concat_to_stack path).
+        Tf = 0
+        x_t_mask: torch.Tensor | None = None
+        if cond_frames is not None:
+            Tf_local, Hf, Wf = self.get_dynamic_size(cond_frames)
+            assert Hf == H and Wf == W, (
+                f"cond_frames spatial dims ({Hf}x{Wf}) must match hidden_states ({H}x{W})"
+            )
+            Tf = Tf_local
+            cond_frames_emb = self.x_embedder(cond_frames.to(dtype))  # [B, Tf*S, C]
+            cond_frames_emb = cond_frames_emb.reshape(B, Tf, S, -1)
+            # Unlike ``x`` above, cond frames ALWAYS receive the initial
+            # spatial_pos_emb, even when ``add_pos_embed_at_every_block=True``.
+            # Mirrors mv ``dit3d.py:1033`` — the per-block pos_emb is then
+            # added on top for both noise and cond tokens during the block
+            # loop, giving cond tokens a double-strength positional signal
+            # that the checkpoint was trained with.
+            cond_frames_emb = cond_frames_emb + spatial_pos_emb
+            x = torch.cat([x, cond_frames_emb], dim=1)  # [B, T+Tf, S, C]
+            # Mask: True for noise frames (first T), False for cond frames (last Tf).
+            mask_1d = (torch.arange(T + Tf, device=x.device) < T)
+            x_t_mask = mask_1d.view(1, T + Tf, 1, 1).expand(B, T + Tf, S, 1).contiguous()
+            T = T + Tf
+
         x = x.reshape(B, T * S, -1)
 
         if _diag:
@@ -1150,8 +1251,8 @@ class MareyTransformer(nn.Module):
         # Always create it because sp inputs needs to split it, then if self.add_pos_embed_at_every_block: false set it to None
         spatial_pos_emb_blocks = spatial_pos_emb.expand(-1, T, -1, -1).reshape(1, T * S, -1)
 
-        # Temporal positions for RoPE
-        temporal_pos = get_temporal_pos(x, T, S)
+        # Temporal positions for RoPE (I2V: append cond_offsets for the appended cond frames).
+        temporal_pos = get_temporal_pos(x, T, S, cond_offsets)
 
         #Pass through SP wrapper for _sp_plan to auto shard them
         temporal_pos = temporal_pos.reshape(temporal_pos.shape[0], T, S) # [B, T, S]
@@ -1165,6 +1266,13 @@ class MareyTransformer(nn.Module):
         x = x.reshape(B, T * S, -1)
         temporal_pos = temporal_pos.reshape(temporal_pos.shape[0], T*S)
         spatial_pos_emb_blocks = spatial_pos_emb_blocks.reshape(1, T*S, -1)
+
+        # I2V: shard x_t_mask along the same S dim as x, bypassing the _sp_plan
+        # framework (which would require x_t_mask to be non-None even for T2V).
+        if x_t_mask is not None:
+            from vllm_omni.diffusion.distributed.sp_sharding import sp_shard
+            x_t_mask = sp_shard(x_t_mask, dim=2, validate=False)  # [1, T, S_local, 1]
+            x_t_mask = x_t_mask.reshape(B, T * S, 1)
 
         if not self.add_pos_embed_at_every_block:
             spatial_pos_emb_blocks = None
@@ -1188,6 +1296,8 @@ class MareyTransformer(nn.Module):
                 t_y=y_t_emb,
                 temporal_pos=temporal_pos,
                 spatial_pos_emb=spatial_pos_emb_blocks,
+                x_t_mask=x_t_mask,
+                t0_x=t0_mlp,
             )
             if _diag and bi in (0, 20, len(self.blocks) - 1):
                 _xf = x.float()
@@ -1204,6 +1314,14 @@ class MareyTransformer(nn.Module):
         x = self.final_layer(x, t_emb_final)
         x = x.reshape(x.shape[0], T, S, -1)
         x = self.sp_output_wrap(x)
+
+        # I2V: drop the appended cond-frame positions before unpatchify so the
+        # returned tensor matches the input noise-latent shape. Mirrors mv
+        # ``dit3d.py:1128-1132``.
+        if Tf > 0:
+            T = T - Tf
+            x = x[:, :T]
+
         x = x.reshape(x.shape[0], T * S_full, -1)
         # Unpatchify
         x = self._unpatchify(x, T, H, W, hidden_states)
