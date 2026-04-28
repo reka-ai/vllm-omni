@@ -9,10 +9,19 @@ diffed against a vllm-omni run with ``compare_dumps.py``.
 
 Activation env vars (same names + on-disk layout as ``DumpMixin``):
 
-  - ``MAREY_DUMP_DIR``           — root dir; this run dumps to ``<dir>/ref_run/``
-  - ``MAREY_LOAD_INITIAL_NOISE`` — path to a .pt file with the initial noise
-  - ``MAREY_LOAD_STEP_NOISE_DIR``— dir containing ``step_noise_<i>.pt`` files
-  - ``MAREY_DUMP_REQUEST_ID``    — override the per-request subdir name (default ``ref_run``)
+  - ``MAREY_DUMP_DIR``               — root dir; this run dumps to ``<dir>/ref_run/``
+  - ``MAREY_LOAD_INITIAL_NOISE``     — path to a .pt file with the initial noise
+  - ``MAREY_LOAD_STEP_NOISE_DIR``    — dir containing ``step_noise_<i>.pt`` files
+  - ``MAREY_LOAD_COND_FRAMES_PATH``  — path to ``cond_frames.pt`` (I2V); substitutes
+                                       the VAE-encoded conditioning latent that
+                                       ``MareyInference._frame_conditions`` returned
+  - ``MAREY_LOAD_COND_OFFSETS_PATH`` — path to ``cond_offsets.pt`` (I2V); substitutes
+                                       the latent-time offsets
+  - ``MAREY_DUMP_BLOCKS_AT_STEPS``   — comma-separated step indices for per-block dumps
+                                       and I2V transformer-internal intermediates
+                                       (``t0_emb``, ``x_after_concat``, ``x_t_mask``,
+                                       ``x_pre_slice``)
+  - ``MAREY_DUMP_REQUEST_ID``        — override the per-request subdir name (default ``ref_run``)
 
 Without any of those set, this script behaves identically to invoking
 moonvalley_ai's marey_inference.py directly.
@@ -64,8 +73,20 @@ for p in (
 DUMP_DIR_ROOT = os.environ.get("MAREY_DUMP_DIR") or None
 LOAD_INITIAL_PATH = os.environ.get("MAREY_LOAD_INITIAL_NOISE") or None
 LOAD_STEP_DIR = os.environ.get("MAREY_LOAD_STEP_NOISE_DIR") or None
+LOAD_COND_FRAMES_PATH = os.environ.get("MAREY_LOAD_COND_FRAMES_PATH") or None
+LOAD_COND_OFFSETS_PATH = os.environ.get("MAREY_LOAD_COND_OFFSETS_PATH") or None
 REQUEST_ID = os.environ.get("MAREY_DUMP_REQUEST_ID", "ref_run")
-ACTIVE = bool(DUMP_DIR_ROOT or LOAD_INITIAL_PATH or LOAD_STEP_DIR)
+_DUMP_BLOCKS_AT_STEPS_ENV = os.environ.get("MAREY_DUMP_BLOCKS_AT_STEPS", "")
+DUMP_BLOCKS_AT_STEPS: set[int] = {
+    int(s) for s in _DUMP_BLOCKS_AT_STEPS_ENV.split(",") if s.strip().isdigit()
+}
+ACTIVE = bool(
+    DUMP_DIR_ROOT
+    or LOAD_INITIAL_PATH
+    or LOAD_STEP_DIR
+    or LOAD_COND_FRAMES_PATH
+    or LOAD_COND_OFFSETS_PATH
+)
 
 
 def _maybe_dump(dump_dir: str | None, name: str, tensor: torch.Tensor) -> None:
@@ -400,6 +421,70 @@ if ACTIVE:
                 "Reference wrapper per-block dump enabled at steps %s (%d blocks)",
                 sorted(dump_blocks_at_steps), len(cand.blocks),
             )
+
+            # I2V transformer-internal dumps via method wrapping. Same
+            # step/label gating as block hooks. Mirrors vllm-omni's
+            # ``DumpMixin._dump_i2v_intermediate``.
+            def _i2v_dump(name: str, tensor: Any) -> None:
+                if not isinstance(tensor, torch.Tensor):
+                    return
+                if current_step[0] not in dump_blocks_at_steps:
+                    return
+                label = current_call_label[0] or "unknown"
+                _maybe_dump(dump_dir, f"step{current_step[0]}_{label}_{name}", tensor)
+
+            # (a) ``mix_time_and_embeddings`` is called twice per forward:
+            # first with the real timestep (→ t_emb), then with zeros
+            # (→ t0_emb) when I2V is active. Detect zero-timestep input
+            # and dump the post-``t_block`` value (the FIRST tuple element,
+            # which mv calls ``t0_emb`` in dit3d.py:1008).
+            if hasattr(cand, "mix_time_and_embeddings"):
+                _orig_mtae = cand.mix_time_and_embeddings
+
+                def _wrap_mtae(timestep: Any, dtype: Any, extra_emb: Any) -> Any:
+                    out = _orig_mtae(timestep, dtype, extra_emb)
+                    is_zero = (
+                        isinstance(timestep, torch.Tensor)
+                        and timestep.numel() > 0
+                        and bool((timestep == 0).all())
+                    )
+                    if is_zero and isinstance(out, tuple) and len(out) >= 1:
+                        _i2v_dump("t0_emb", out[0])
+                    return out
+
+                cand.mix_time_and_embeddings = _wrap_mtae  # type: ignore[assignment]
+
+            # (b) ``split_sp_variables`` receives the pre-shard ``sp_vars``
+            # dict containing ``x`` (post-concat) and ``x_t_mask``. Capture
+            # both pre-shard so they line up with vllm-omni's pre-shard dumps.
+            if hasattr(cand, "split_sp_variables"):
+                _orig_split_sp = cand.split_sp_variables
+
+                def _wrap_split_sp(sp_vars: dict, *args: Any, **kwargs: Any) -> Any:
+                    if isinstance(sp_vars, dict):
+                        if "x" in sp_vars and isinstance(sp_vars["x"], torch.Tensor):
+                            _i2v_dump("x_after_concat", sp_vars["x"])
+                        x_t_mask = sp_vars.get("x_t_mask")
+                        if isinstance(x_t_mask, torch.Tensor):
+                            _i2v_dump("x_t_mask", x_t_mask)
+                    return _orig_split_sp(sp_vars, *args, **kwargs)
+
+                cand.split_sp_variables = _wrap_split_sp  # type: ignore[assignment]
+
+            # (c) ``gather_sequence`` is called after ``final_layer`` and
+            # before the I2V slice. Capture the gathered post-final-layer
+            # value (first element of the returned tuple) as x_pre_slice.
+            if hasattr(cand, "gather_sequence"):
+                _orig_gather = cand.gather_sequence
+
+                def _wrap_gather(*args: Any, **kwargs: Any) -> Any:
+                    out = _orig_gather(*args, **kwargs)
+                    if isinstance(out, tuple) and len(out) >= 1 and isinstance(out[0], torch.Tensor):
+                        _i2v_dump("x_pre_slice", out[0])
+                    return out
+
+                cand.gather_sequence = _wrap_gather  # type: ignore[assignment]
+
             for block_idx, block in enumerate(cand.blocks):
                 def _make_post_hook(bi: int):
                     def _hook(module, args, kwargs, output):
@@ -513,6 +598,92 @@ if ACTIVE:
 # ---------------------------------------------------------------------------
 
 import marey_inference  # noqa: E402  (must come after monkey-patch above)
+
+
+# ---------------------------------------------------------------------------
+# I2V: monkey-patch ``MareyInference._frame_conditions`` to dump and optionally
+# inject the VAE-encoded conditioning latents (cond_frames) and latent-time
+# offsets (cond_offsets). Runs BEFORE ``RFLOW.sample`` (the patched call), so
+# the dump_dir is reconstructed from env directly.
+# ---------------------------------------------------------------------------
+
+if ACTIVE and hasattr(marey_inference, "MareyInference"):
+    _orig_frame_conditions = marey_inference.MareyInference._frame_conditions
+
+    # Rank-0 only writes; loading happens on every rank (each rank needs the
+    # full cond_frames tensor, same policy as initial noise loading).
+    try:
+        import torch.distributed as _dist_fc
+        _rank_fc = _dist_fc.get_rank() if _dist_fc.is_available() and _dist_fc.is_initialized() else 0
+    except Exception:
+        _rank_fc = 0
+    _dump_enabled_fc = _rank_fc == 0
+
+    def _patched_frame_conditions(
+        self: Any,
+        frame_conditions: dict,
+        device: torch.device,
+        output_dimensions: tuple,
+        high_precision_input: bool = False,
+    ) -> dict:
+        result = _orig_frame_conditions(
+            self, frame_conditions, device, output_dimensions, high_precision_input
+        )
+        cond_frames = result.get("cond_frames")
+        cond_offsets = result.get("cond_offsets")
+
+        if DUMP_DIR_ROOT and _dump_enabled_fc:
+            dump_dir = os.path.join(DUMP_DIR_ROOT, REQUEST_ID)
+            os.makedirs(dump_dir, exist_ok=True)
+            if isinstance(cond_frames, torch.Tensor):
+                _maybe_dump(dump_dir, "cond_frames", cond_frames)
+            if isinstance(cond_offsets, torch.Tensor):
+                _maybe_dump(dump_dir, "cond_offsets", cond_offsets)
+            logger.warning(
+                "(rank 0) _frame_conditions dumped: cond_frames.shape=%s "
+                "cond_offsets=%s",
+                tuple(cond_frames.shape) if isinstance(cond_frames, torch.Tensor) else None,
+                cond_offsets.tolist() if isinstance(cond_offsets, torch.Tensor) else None,
+            )
+
+        # Optional injection from a reference dump (e.g. vllm-omni's). Every
+        # rank loads independently because every rank needs the full tensor.
+        if LOAD_COND_FRAMES_PATH and isinstance(cond_frames, torch.Tensor):
+            if os.path.exists(LOAD_COND_FRAMES_PATH):
+                loaded = torch.load(LOAD_COND_FRAMES_PATH, map_location=cond_frames.device)
+                if tuple(loaded.shape) == tuple(cond_frames.shape):
+                    result["cond_frames"] = loaded.to(
+                        device=cond_frames.device, dtype=cond_frames.dtype
+                    )
+                    logger.warning(
+                        "_frame_conditions loaded cond_frames from %s",
+                        LOAD_COND_FRAMES_PATH,
+                    )
+                else:
+                    logger.warning(
+                        "_frame_conditions SKIPPING cond_frames load: shape %s != ref %s",
+                        tuple(loaded.shape), tuple(cond_frames.shape),
+                    )
+        if LOAD_COND_OFFSETS_PATH and isinstance(cond_offsets, torch.Tensor):
+            if os.path.exists(LOAD_COND_OFFSETS_PATH):
+                loaded = torch.load(LOAD_COND_OFFSETS_PATH, map_location=cond_offsets.device)
+                if tuple(loaded.shape) == tuple(cond_offsets.shape):
+                    # Preserve int64 dtype.
+                    result["cond_offsets"] = loaded.to(device=cond_offsets.device)
+                    logger.warning(
+                        "_frame_conditions loaded cond_offsets from %s (values %s)",
+                        LOAD_COND_OFFSETS_PATH, loaded.tolist(),
+                    )
+                else:
+                    logger.warning(
+                        "_frame_conditions SKIPPING cond_offsets load: shape %s != ref %s",
+                        tuple(loaded.shape), tuple(cond_offsets.shape),
+                    )
+
+        return result
+
+    marey_inference.MareyInference._frame_conditions = _patched_frame_conditions  # type: ignore[assignment]
+
 
 if __name__ == "__main__":
     marey_inference.app()

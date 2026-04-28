@@ -25,11 +25,27 @@ Activation: any of these env vars set will engage the mixin:
                                            reference run; substitutes every per-step transformer
                                            input (hidden_states, timestep, encoder_hidden_states,
                                            vector_cond, extra_features) via a forward pre-hook
+  - ``MAREY_LOAD_COND_FRAMES_PATH``      — path to ``cond_frames.pt`` from a reference run;
+                                           substitutes the I2V VAE-encoded conditioning latent
+                                           that ``MareyPipeline._encode_cond_frames`` returned.
+  - ``MAREY_LOAD_COND_OFFSETS_PATH``     — path to ``cond_offsets.pt`` from a reference run;
+                                           substitutes the I2V latent-time offsets.
+  - ``MAREY_LOAD_PIPELINE_LATENTS_DIR``  — dir containing ``step<i>_cond_hidden_states.pt`` from a
+                                           reference run; substitutes the pipeline's local
+                                           ``z`` variable at the START of each denoising
+                                           iteration (the value used both by the transformer
+                                           call AND by the inline DDPM update). Defines the L0
+                                           tier — strictest possible isolation: only the LAST
+                                           iteration's transformer drift can propagate to
+                                           ``z_final`` because every prior step's drift gets
+                                           overwritten on the next iteration boundary.
   - ``MAREY_DUMP_BLOCKS_AT_STEPS``       — comma-separated step indices at which to dump every
                                            DiT block's (x, y) output as
-                                           ``step<i>_<label>_block<b>_{x,y}_out.pt``. Default
-                                           unset (no block dumping). Use ``"0"`` for step-0-only
-                                           localization of transformer forward divergence.
+                                           ``step<i>_<label>_block<b>_{x,y}_out.pt`` AND the
+                                           transformer-internal I2V intermediates
+                                           (``t0_emb``, ``x_after_concat``, ``x_t_mask``,
+                                           ``x_pre_slice``). Default unset. Use ``"0"`` for
+                                           step-0-only localization of transformer divergence.
 
 If none are set, the mixin is inert (no overhead, no behavior change).
 
@@ -45,6 +61,17 @@ Naming convention for dumped tensors (same on both sides — ref and vllm-omni):
   step<i>_<cond|uncond>_vector_cond.pt
   step<i>_<cond|uncond>_extra_<key>.pt
   step<i>_<cond|uncond>_v_pred.pt
+
+I2V (image-to-video) tensors. (1)(2)(3) are once-per-request; (4)(5) are per-step
+and gated by ``MAREY_DUMP_BLOCKS_AT_STEPS`` to keep file count bounded.
+
+  cond_images.pt                           — (1, C=3, T_kf, H, W) in [-1, 1], pre-VAE
+  cond_frames.pt                           — (1, C_vae, T_lat, H_lat, W_lat), post-VAE
+  cond_offsets.pt                          — int64 (T_kf,), latent-time offsets
+  step<i>_<label>_t0_emb.pt                — (B, hidden), t_embedder(zeros)+vec_cond
+  step<i>_<label>_x_after_concat.pt        — pre-SP-shard concat result (full tensor)
+  step<i>_<label>_x_t_mask.pt              — pre-SP-shard mask (bool)
+  step<i>_<label>_x_pre_slice.pt           — post-final_layer post-all-gather, pre-slice
 
 Cond/uncond labelling on the vllm-omni side is detected by tensor identity
 (same Python object as the cached ``encode_prompt`` cond/uncond text emb).
@@ -91,6 +118,15 @@ class DumpMixin:
         self._load_transformer_inputs_dir: str | None = (
             os.environ.get("MAREY_LOAD_TRANSFORMER_INPUTS_DIR") or None
         )
+        self._load_cond_frames_path: str | None = (
+            os.environ.get("MAREY_LOAD_COND_FRAMES_PATH") or None
+        )
+        self._load_cond_offsets_path: str | None = (
+            os.environ.get("MAREY_LOAD_COND_OFFSETS_PATH") or None
+        )
+        self._load_pipeline_latents_dir: str | None = (
+            os.environ.get("MAREY_LOAD_PIPELINE_LATENTS_DIR") or None
+        )
         _dump_blocks_env = os.environ.get("MAREY_DUMP_BLOCKS_AT_STEPS", "")
         self._dump_blocks_at_steps: set[int] = {
             int(s) for s in _dump_blocks_env.split(",") if s.strip().isdigit()
@@ -112,6 +148,9 @@ class DumpMixin:
             or self._load_step_noise_dir
             or self._load_text_embeds_dir
             or self._load_transformer_inputs_dir
+            or self._load_cond_frames_path
+            or self._load_cond_offsets_path
+            or self._load_pipeline_latents_dir
         )
         self._current_dump_dir: str | None = None
 
@@ -133,12 +172,15 @@ class DumpMixin:
 
         logger.warning(
             "DumpMixin active: dump_dir=%s load_initial=%s load_step_dir=%s "
-            "load_text_embeds_dir=%s load_transformer_inputs_dir=%s",
+            "load_text_embeds_dir=%s load_transformer_inputs_dir=%s "
+            "load_cond_frames_path=%s load_cond_offsets_path=%s",
             self._dump_dir_root,
             self._load_initial_noise_path,
             self._load_step_noise_dir,
             self._load_text_embeds_dir,
             self._load_transformer_inputs_dir,
+            self._load_cond_frames_path,
+            self._load_cond_offsets_path,
         )
 
         # Wrap encode_prompt so we capture text encoder outputs without
@@ -151,6 +193,16 @@ class DumpMixin:
         # MAREY_LOAD_TRANSFORMER_INPUTS_DIR env var isn't set (post-hook reads
         # the stash first, falls back to id-matching on the current ehs).
         if hasattr(self, "transformer") and self.transformer is not None:
+            # Attach self to the transformer so its I2V branch can call back
+            # to ``_dump_i2v_intermediate`` for tensors that are local to
+            # ``MareyTransformer.forward()`` (t0_emb, x_after_concat,
+            # x_t_mask, x_pre_slice). MUST bypass ``nn.Module.__setattr__``
+            # via the instance ``__dict__``: a plain assignment would store
+            # ``MareyPipeline`` (itself an ``nn.Module``) as a child module
+            # of ``self.transformer``, creating a pipeline ↔ transformer
+            # cycle that breaks recursive ``module.train()`` / ``eval()``.
+            self.transformer.__dict__["_dump_pipeline"] = self
+
             self.transformer.register_forward_pre_hook(
                 self._transformer_forward_pre_hook, with_kwargs=True
             )
@@ -631,6 +683,131 @@ class DumpMixin:
             if y_in is not None:
                 self._dump(f"{prefix}_y_in", y_in)
         return _hook
+
+    # -- I2V hooks (called by the pipeline / transformer) -------------------
+
+    def _dump_cond_images(self, cond_images: torch.Tensor) -> None:
+        """Capture the pre-VAE conditioning image stack as ``cond_images.pt``.
+
+        Called once per request from ``MareyPipeline.forward()`` right before
+        ``_encode_cond_frames``. Shape: ``(1, C=3, T_kf, H, W)`` in ``[-1, 1]``.
+        """
+        if self._current_dump_dir:
+            self._dump("cond_images", cond_images)
+
+    def _dump_cond_frames(
+        self, cond_frames: torch.Tensor, cond_offsets: torch.Tensor
+    ) -> None:
+        """Capture the I2V VAE-encoded conditioning latent + latent offsets.
+
+        Called once per request from ``MareyPipeline.forward()`` right after
+        ``_encode_cond_frames`` returns. Shapes: ``cond_frames`` is
+        ``(1, C_vae, T_lat, H_lat, W_lat)``; ``cond_offsets`` is int64 ``(T_kf,)``.
+        """
+        if self._current_dump_dir:
+            self._dump("cond_frames", cond_frames)
+            self._dump("cond_offsets", cond_offsets)
+
+    def _maybe_load_cond_frames(self, default: torch.Tensor) -> torch.Tensor:
+        """Substitute ``cond_frames`` from ``MAREY_LOAD_COND_FRAMES_PATH`` if set.
+
+        Returns ``default`` unchanged when the env var is unset, the file is
+        missing, or shapes don't match (warmup/profile pass).
+        """
+        if not self._load_cond_frames_path or default is None:
+            return default
+        if not os.path.exists(self._load_cond_frames_path):
+            logger.warning(
+                "DumpMixin cond_frames load: %s absent, keeping vllm-omni value",
+                self._load_cond_frames_path,
+            )
+            return default
+        loaded = torch.load(self._load_cond_frames_path, map_location=default.device)
+        if tuple(loaded.shape) != tuple(default.shape):
+            logger.warning(
+                "DumpMixin SKIPPING cond_frames load: shape %s != ref %s",
+                tuple(loaded.shape), tuple(default.shape),
+            )
+            return default
+        loaded = loaded.to(device=default.device, dtype=default.dtype)
+        logger.warning(
+            "DumpMixin loaded cond_frames from %s (shape %s)",
+            self._load_cond_frames_path, tuple(loaded.shape),
+        )
+        return loaded
+
+    def _maybe_load_cond_offsets(self, default: torch.Tensor) -> torch.Tensor:
+        """Substitute ``cond_offsets`` from ``MAREY_LOAD_COND_OFFSETS_PATH`` if set."""
+        if not self._load_cond_offsets_path or default is None:
+            return default
+        if not os.path.exists(self._load_cond_offsets_path):
+            logger.warning(
+                "DumpMixin cond_offsets load: %s absent, keeping vllm-omni value",
+                self._load_cond_offsets_path,
+            )
+            return default
+        loaded = torch.load(self._load_cond_offsets_path, map_location=default.device)
+        if tuple(loaded.shape) != tuple(default.shape):
+            logger.warning(
+                "DumpMixin SKIPPING cond_offsets load: shape %s != ref %s",
+                tuple(loaded.shape), tuple(default.shape),
+            )
+            return default
+        # Preserve ref dtype (int64) — don't coerce to default's dtype.
+        loaded = loaded.to(device=default.device)
+        logger.warning(
+            "DumpMixin loaded cond_offsets from %s (values %s)",
+            self._load_cond_offsets_path, loaded.tolist(),
+        )
+        return loaded
+
+    def _maybe_load_pipeline_latents(
+        self, default: torch.Tensor, step_idx: int
+    ) -> torch.Tensor:
+        """L0 hook: substitute the pipeline's ``z`` variable at the start of
+        iteration ``step_idx`` with mv's ``step<step_idx>_cond_hidden_states.pt``.
+
+        Called from ``MareyPipeline.forward()`` at the top of the denoising
+        loop body. With the pre-hook already substituting the transformer's
+        kwarg, this additionally resets the LOCAL ``z`` so the inline DDPM
+        update (``x0 = z - sigma * v_pred``) also operates on mv's state —
+        eliminating the L1 cross-step accumulation that compounds per-step
+        v_pred drift through the scheduler over all 33 steps.
+
+        No-op when ``MAREY_LOAD_PIPELINE_LATENTS_DIR`` is unset, when the
+        per-step file is missing (e.g. warmup pass), or when shapes mismatch.
+        """
+        if not self._load_pipeline_latents_dir:
+            return default
+        path = os.path.join(
+            self._load_pipeline_latents_dir, f"step{step_idx}_cond_hidden_states.pt"
+        )
+        if not os.path.exists(path):
+            return default
+        loaded = torch.load(path, map_location=default.device)
+        if tuple(loaded.shape) != tuple(default.shape):
+            logger.warning(
+                "DumpMixin SKIPPING pipeline_latents step %d load: shape %s != ref %s",
+                step_idx, tuple(loaded.shape), tuple(default.shape),
+            )
+            return default
+        return loaded.to(device=default.device, dtype=default.dtype)
+
+    def _dump_i2v_intermediate(self, name: str, tensor: torch.Tensor) -> None:
+        """Capture an I2V transformer-internal tensor.
+
+        Called from ``MareyTransformer.forward()`` for ``t0_emb``,
+        ``x_after_concat``, ``x_t_mask``, and ``x_pre_slice``. Uses
+        ``_pending_call_label`` (cond/uncond, set by the pre-hook) and
+        ``_current_step`` to construct the filename. Gated by step in
+        ``MAREY_DUMP_BLOCKS_AT_STEPS`` to keep file count bounded.
+        """
+        if not self._current_dump_dir:
+            return
+        if self._current_step not in self._dump_blocks_at_steps:
+            return
+        label = self._pending_call_label or "unknown"
+        self._dump(f"step{self._current_step}_{label}_{name}", tensor)
 
     # -- final-latent hook (called by pipeline just before VAE decode) ------
 

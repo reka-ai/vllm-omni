@@ -42,6 +42,15 @@ case "${LEVEL}" in
     base|"")
         :
         ;;
+    L0)
+        # Strictest tier: L1 + per-iteration overwrite of pipeline `z` so
+        # only the LAST step's transformer drift propagates to z_final.
+        export MAREY_LOAD_INITIAL_NOISE="${MAREY_LOAD_INITIAL_NOISE:-${REF_DIR}/z_initial.pt}"
+        export MAREY_LOAD_STEP_NOISE_DIR="${MAREY_LOAD_STEP_NOISE_DIR:-${REF_DIR}}"
+        export MAREY_LOAD_TEXT_EMBEDS_DIR="${MAREY_LOAD_TEXT_EMBEDS_DIR:-${REF_DIR}}"
+        export MAREY_LOAD_TRANSFORMER_INPUTS_DIR="${MAREY_LOAD_TRANSFORMER_INPUTS_DIR:-${REF_DIR}}"
+        export MAREY_LOAD_PIPELINE_LATENTS_DIR="${MAREY_LOAD_PIPELINE_LATENTS_DIR:-${REF_DIR}}"
+        ;;
     L1)
         export MAREY_LOAD_INITIAL_NOISE="${MAREY_LOAD_INITIAL_NOISE:-${REF_DIR}/z_initial.pt}"
         export MAREY_LOAD_STEP_NOISE_DIR="${MAREY_LOAD_STEP_NOISE_DIR:-${REF_DIR}}"
@@ -58,7 +67,7 @@ case "${LEVEL}" in
         export MAREY_LOAD_STEP_NOISE_DIR="${MAREY_LOAD_STEP_NOISE_DIR:-${REF_DIR}}"
         ;;
     *)
-        echo "[phase2] ERROR: unknown LEVEL=${LEVEL}. Use base | L1 | L2 | L3."
+        echo "[phase2] ERROR: unknown LEVEL=${LEVEL}. Use base | L0 | L1 | L2 | L3."
         exit 2
         ;;
 esac

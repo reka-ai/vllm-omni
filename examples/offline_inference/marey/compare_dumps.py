@@ -133,6 +133,13 @@ def _category(name: str) -> str:
         return "timesteps_schedule"
     if name.startswith("step_noise_"):
         return "step_noise"
+    # I2V once-per-request tensors.
+    if name == "cond_images":
+        return "i2v_cond_images"
+    if name == "cond_frames":
+        return "i2v_cond_frames"
+    if name == "cond_offsets":
+        return "i2v_cond_offsets"
     # Text encoder outputs: encode_<label>_<field>[_<j>]
     if name.startswith("encode_"):
         if "_seq_cond" in name:
@@ -160,6 +167,18 @@ def _category(name: str) -> str:
         # vllm-omni DumpMixin dumps as extra_<k>. Same bucket.
         if tail.startswith("extra_") or tail.startswith("kw_"):
             return "transformer_extra"
+        # I2V transformer-internal intermediates.
+        if tail == "t0_emb":
+            return "i2v_t0_emb"
+        if tail == "x_after_concat":
+            return "i2v_x_after_concat"
+        if tail == "x_t_mask":
+            return "i2v_x_t_mask"
+        if tail == "x_pre_slice":
+            return "i2v_x_pre_slice"
+        # Per-block dumps (T2V): step<i>_<label>_block<b>_{x,y}_{in,out}
+        if tail.startswith("block"):
+            return "transformer_block"
         return "transformer_misc"
     return "other"
 
@@ -331,7 +350,10 @@ def main() -> int:
         print(f"  {cat:<26}  {len(ds):>4}  {mean_rel:>10.3e}  {max_rel:>10.3e}  {min_cos:>10.6f}")
 
     # Per-step trajectory for v_pred and step_noise (the most informative)
-    for cat in ("transformer_v_pred", "step_noise", "transformer_hidden_states"):
+    for cat in (
+        "transformer_v_pred", "step_noise", "transformer_hidden_states",
+        "i2v_t0_emb", "i2v_x_after_concat", "i2v_x_t_mask", "i2v_x_pre_slice",
+    ):
         if cat in by_category:
             _summary_by_step(by_category[cat], cat)
 

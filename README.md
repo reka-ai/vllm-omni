@@ -136,3 +136,11 @@ torchrun --nproc_per_node=8 ${PATH_TO_MOONVALLEY_AI}/inference-service/marey_inf
   --output /home/aormazabal/wlam/wlam-inference//vllm-omni/marey_inference_test_output_$(date +%Y%m%d_%H%M%S).mp4 \
   "Detailed Description: A majestic, aged eagle with mottled golden-brown feathers soars gracefully through a vast, ancient indoor chamber. Its expansive wings barely flap, catching the air as it glides effortlessly between towering stone pillars adorned with glinting metallic accents. Beams of morning light pierce the gloom, filtering through a cracked skylight high above and illuminating swirling dust motes in their path. The camera pans smoothly, following the eagle's silent flight as it navigates the cavernous space, its sharp eyes scanning the stone floor below, creating a scene of serene power and timeless solitude. Background: The far reaches of the chamber fade into deep shadow, with the silhouettes of distant pillars barely visible. High above, a cracked skylight serves as the primary light source, its fractured glass creating distinct rays of light. Middleground: The aged eagle glides on a steady path, its mottled golden-brown wings spread wide. It passes through the dramatic beams of light, which highlight the intricate details of its feathers and the dust particles dancing in the air. Foreground: The camera looks up from a low angle, tracking the eagle's movement across the expansive stone floor, which is patterned with the bright shafts of light and deep shadows cast by the pillars."
 ```
+
+## Marey Parity Reports (vllm-omni vs moonvalley_ai)
+
+Cross-codebase parity verification at three injection tiers (L1/L2/L3) for both T2V and I2V:
+
+- **T2V**: `examples/phase2/PHASE2_FINDINGS.md` (L1 cos 0.998886, residual ~0.81% from FA3 build mismatch)
+- **I2V**: `examples/phase3_i2v/PHASE3_FINDINGS.md` (single-frame + multi-keyframe sweeps; up to 15× tighter than T2V at L2/L3 thanks to cond-frame anchoring)
+
