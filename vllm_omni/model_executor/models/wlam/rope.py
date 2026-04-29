@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from enum import Enum
 
 import torch
 import torch.nn as nn
@@ -18,6 +19,7 @@ class WLAMMultimodalRotaryEmbedding(nn.Module):
         mrope_section: list[int],
         *,
         base: int = 10000,
+        mode: str = "standard",
     ) -> None:
         super().__init__()
         if len(mrope_section) not in (3, 4):
@@ -29,22 +31,18 @@ class WLAMMultimodalRotaryEmbedding(nn.Module):
         self.head_dim = head_dim
         self.mrope_section = list(mrope_section)
         self.base = base
-
-    def _axis_freqs(
-        self,
-        positions: torch.Tensor,
-        slots: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if slots == 0:
-            empty = positions.new_empty((*positions.shape, 0), dtype=torch.float32)
-            return empty, empty
-        inv_freq = 1.0 / (
-            self.base
-            ** (torch.arange(0, slots, device=positions.device, dtype=torch.float32) / max(slots, 1))
-        )
-        freqs = positions.float().unsqueeze(-1) * inv_freq.unsqueeze(0)
-        emb = torch.cat([freqs, freqs], dim=-1)
-        return emb.cos(), emb.sin()
+        self.mode = _normalize_mode(mode)
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        if self.mode == "interleaved":
+            n = len(self.mrope_section)
+            half_dim = head_dim // 2
+            for axis, slots in enumerate(self.mrope_section):
+                available = (half_dim - axis - 1) // n + 1
+                if available < slots:
+                    raise ValueError(
+                        f"interleaved mrope section {axis} needs {slots} frequencies, got {available}"
+                    )
 
     def cos_sin(
         self,
@@ -57,20 +55,35 @@ class WLAMMultimodalRotaryEmbedding(nn.Module):
                 f"position_ids must be [N, {len(self.mrope_section)}], got {tuple(position_ids.shape)}"
             )
 
-        cos_parts: list[torch.Tensor] = []
-        sin_parts: list[torch.Tensor] = []
+        inv_freq = self.inv_freq.to(device=position_ids.device, dtype=torch.float32)
+        freqs_parts: list[torch.Tensor] = []
+        offset = 0
+        n_axes = len(self.mrope_section)
         for axis, slots in enumerate(self.mrope_section):
-            c, s = self._axis_freqs(position_ids[:, axis], slots)
-            cos_parts.append(c)
-            sin_parts.append(s)
+            pos = position_ids[:, axis].float().unsqueeze(-1)
+            if self.mode == "standard":
+                freq_slice = inv_freq[offset : offset + slots]
+                offset += slots
+            elif self.mode == "restart":
+                freq_slice = inv_freq[:slots]
+            elif self.mode == "interleaved":
+                freq_slice = inv_freq[axis::n_axes][:slots]
+            else:
+                raise ValueError(f"Unknown mrope mode {self.mode!r}")
+            freqs_parts.append(pos * freq_slice.unsqueeze(0))
 
-        used = 2 * sum(self.mrope_section)
-        if used < self.head_dim:
-            pad = self.head_dim - used
-            cos_parts.append(torch.ones(position_ids.shape[0], pad, device=position_ids.device))
-            sin_parts.append(torch.zeros(position_ids.shape[0], pad, device=position_ids.device))
-
-        return torch.cat(cos_parts, dim=-1).to(dtype), torch.cat(sin_parts, dim=-1).to(dtype)
+        freqs = torch.cat(freqs_parts, dim=-1)
+        half_dim = self.head_dim // 2
+        if freqs.shape[-1] < half_dim:
+            pad = torch.zeros(
+                position_ids.shape[0],
+                half_dim - freqs.shape[-1],
+                device=position_ids.device,
+                dtype=torch.float32,
+            )
+            freqs = torch.cat([freqs, pad], dim=-1)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        return emb.cos().to(dtype), emb.sin().to(dtype)
 
     def apply(
         self,
@@ -98,3 +111,11 @@ def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> to
     if dim % 2:
         emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
     return emb
+
+
+def _normalize_mode(mode: str | Enum) -> str:
+    value = mode.value if isinstance(mode, Enum) else str(mode)
+    value = value.split(".")[-1].lower()
+    if value not in {"standard", "restart", "interleaved"}:
+        raise ValueError(f"Unsupported mrope frequency mode {mode!r}")
+    return value

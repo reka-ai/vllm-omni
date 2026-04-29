@@ -14,7 +14,6 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.models.wlam.common import WLAMModelArgs
-from vllm_omni.model_executor.models.wlam.rope import timestep_embedding
 
 from .transformer import WLAMDiffusionTransformer
 
@@ -177,11 +176,10 @@ class WLAMDiffusionPipeline(nn.Module):
         dt = 1.0 / max(num_steps, 1)
         for t in timesteps:
             t_batch = t.expand(latents.shape[0])
-            t_emb = timestep_embedding(t_batch * 1000.0, self.args.hidden_size).to(device=self.device, dtype=self.dtype)
             v_pred = self.transformer(
                 latents,
                 position_ids,
-                t_emb,
+                t_batch * 1000.0,
                 past_key_values=past_key_values,
             )
             latents = latents - dt * v_pred

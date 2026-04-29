@@ -7,13 +7,8 @@ import torch
 import torch.nn as nn
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -27,12 +22,20 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .common import WLAMModelArgs
+from .common_layers import WLAMAdaLN, WLAMSwiGLUMLP, as_tensor, gate_residual_update, t2i_modulate
+from .conditioning import (
+    WLAMCondition,
+    WLAMTimeEmbedMode,
+    WLAMSinusoidalEmbedder,
+    combine_adaln_conditions,
+    embed_scalar_condition,
+)
 from .layout import WLAMTokenLayout, WLAMTokenType
 from .rope import WLAMMultimodalRotaryEmbedding
 
 
 def _as_tensor(x: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]) -> torch.Tensor:
-    return x[0] if isinstance(x, tuple) else x
+    return as_tensor(x)
 
 
 def _compact_or_full(
@@ -51,38 +54,6 @@ def _compact_or_full(
     raise ValueError(
         f"{name} must have first dim {full_len} or {idx.numel()}, got {tuple(tensor.shape)}"
     )
-
-
-class WLAMMLP(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        *,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            input_size=hidden_size,
-            output_sizes=[intermediate_size, intermediate_size],
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-        self.down_proj = RowParallelLinear(
-            input_size=intermediate_size,
-            output_size=hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
-        )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = _as_tensor(self.gate_up_proj(x))
-        x = self.act_fn(x)
-        return _as_tensor(self.down_proj(x))
 
 
 class WLAMARAttention(nn.Module):
@@ -146,6 +117,7 @@ class WLAMARAttention(nn.Module):
             self.head_dim,
             args.mrope_section or [2, 2, 31, 31],
             base=args.rope_theta,
+            mode=args.mrope_freq_mode,
         )
         self.attn = Attention(
             self.qkv_proj.num_heads,
@@ -206,19 +178,20 @@ class WLAMARDecoderLayer(nn.Module):
             self.input_layernorm_diffusion = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         if args.use_dual_mlp_weights:
             self.post_attention_layernorm_diffusion = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-            self.mlp_diffusion = WLAMMLP(
+            self.mlp_diffusion = WLAMSwiGLUMLP(
                 args.hidden_size,
-                args.intermediate_size,
+                args.diffusion_intermediate_size or args.intermediate_size,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp_diffusion",
             )
+        self.modulation_diffusion = WLAMAdaLN(args.hidden_size) if args.use_time_modulation else None
         self.self_attn = WLAMARAttention(
             args,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
-        self.mlp = WLAMMLP(
+        self.mlp = WLAMSwiGLUMLP(
             args.hidden_size,
             args.intermediate_size,
             quant_config=quant_config,
@@ -230,7 +203,15 @@ class WLAMARDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         layout: WLAMTokenLayout,
+        adaln_condition: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        target_idx = layout.diffusion_target_idx
+        modulation = None
+        if adaln_condition is not None and target_idx.numel() > 0:
+            if self.modulation_diffusion is None:
+                raise ValueError("adaln_condition was provided but use_time_modulation=False")
+            modulation = self.modulation_diffusion(adaln_condition)
+
         residual = hidden_states
         if self.args.use_dual_attn_weights and layout.has_diffusion:
             normed = layout.apply(
@@ -240,7 +221,15 @@ class WLAMARDecoderLayer(nn.Module):
             )
         else:
             normed = self.input_layernorm(hidden_states)
-        hidden_states = residual + self.self_attn(normed, position_ids, layout)
+        if modulation is not None:
+            normed = normed.index_put(
+                (target_idx,),
+                t2i_modulate(normed[target_idx], modulation.shift_msa, modulation.scale_msa),
+            )
+        attn_out = self.self_attn(normed, position_ids, layout)
+        if modulation is not None:
+            attn_out = gate_residual_update(attn_out, modulation.gate_msa, target_idx)
+        hidden_states = residual + attn_out
 
         residual = hidden_states
         if self.args.use_dual_mlp_weights and layout.has_diffusion:
@@ -253,6 +242,16 @@ class WLAMARDecoderLayer(nn.Module):
         else:
             normed = self.post_attention_layernorm(hidden_states)
             mlp_out = self.mlp(normed)
+        if modulation is not None:
+            normed = normed.index_put(
+                (target_idx,),
+                t2i_modulate(normed[target_idx], modulation.shift_mlp, modulation.scale_mlp),
+            )
+            if self.args.use_dual_mlp_weights and layout.has_diffusion:
+                mlp_out = layout.apply(normed, self.mlp, self.mlp_diffusion)
+            else:
+                mlp_out = self.mlp(normed)
+            mlp_out = gate_residual_update(mlp_out, modulation.gate_mlp, target_idx)
         return residual + mlp_out
 
 
@@ -261,6 +260,7 @@ class WLAMARModel(nn.Module):
         self,
         args: WLAMModelArgs,
         *,
+        config: Any | None = None,
         cache_config: CacheConfig | None,
         quant_config: QuantizationConfig | None,
         prefix: str = "",
@@ -295,6 +295,15 @@ class WLAMARModel(nn.Module):
             nn.Linear(args.visual_latent_dim, args.hidden_size, bias=True),
             nn.GELU(),
             nn.Linear(args.hidden_size, args.hidden_size, bias=True),
+        )
+        self.diffusion_time_embedder = WLAMSinusoidalEmbedder(args.hidden_size)
+        self.aspect_ratio_embedder = (
+            WLAMSinusoidalEmbedder(args.hidden_size) if args.use_aspect_ratio_cond else None
+        )
+        self.diffusion_modulation_proj = (
+            nn.Sequential(nn.SiLU(), nn.Linear(args.hidden_size, args.hidden_size, bias=True), nn.SiLU())
+            if args.time_embed_mode == WLAMTimeEmbedMode.ADALN.value
+            else None
         )
         self.layers = nn.ModuleList(
             [
@@ -361,6 +370,100 @@ class WLAMARModel(nn.Module):
             return runtime_types.long()
         return torch.full_like(input_ids, int(WLAMTokenType.TEXT))
 
+    def _runtime_or_kwarg_tensor(
+        self,
+        kwargs: dict[str, Any],
+        runtime: list[dict[str, Any]] | None,
+        key: str,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        value = kwargs.get(key)
+        if value is None:
+            value = self._runtime_tensor(runtime, key, device=device)
+        if value is None:
+            return None
+        return value if isinstance(value, torch.Tensor) else torch.tensor(value, device=device)
+
+    def _scalar_condition(
+        self,
+        kwargs: dict[str, Any],
+        runtime: list[dict[str, Any]] | None,
+        key: str,
+        instance_key: str,
+        embedder: WLAMSinusoidalEmbedder,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> WLAMCondition | None:
+        value = self._runtime_or_kwarg_tensor(kwargs, runtime, key, device=device)
+        if value is None:
+            return None
+        instance_ids = self._runtime_or_kwarg_tensor(kwargs, runtime, instance_key, device=device)
+        if instance_ids is not None:
+            instance_ids = instance_ids.long()
+        return embed_scalar_condition(
+            value.to(device=device, dtype=dtype),
+            embedder,
+            instance_ids,
+            dtype,
+            expand_instance_eager=self.args.expand_instance_eager,
+        )
+
+    def _build_adaln_condition(
+        self,
+        layout: WLAMTokenLayout,
+        runtime: list[dict[str, Any]] | None,
+        kwargs: dict[str, Any],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        if layout.diffusion_target_idx.numel() == 0:
+            return None
+        timestep = self._scalar_condition(
+            kwargs,
+            runtime,
+            "timestep",
+            "time_instance_ids",
+            self.diffusion_time_embedder,
+            device=device,
+            dtype=dtype,
+        )
+        if timestep is None:
+            raise ValueError("timestep is required when time_embed_mode=adaLN and diffusion targets are present")
+
+        conditions = [timestep]
+        if self.args.use_aspect_ratio_cond and self.args.metadata_embed_mode == WLAMTimeEmbedMode.ADALN.value:
+            if self.aspect_ratio_embedder is None:
+                raise ValueError("aspect ratio conditioning requested without aspect_ratio_embedder")
+            aspect = self._scalar_condition(
+                kwargs,
+                runtime,
+                "aspect_ratio",
+                "aspect_ratio_instance_ids",
+                self.aspect_ratio_embedder,
+                device=device,
+                dtype=dtype,
+            )
+            if aspect is None:
+                raise ValueError("aspect_ratio is required when metadata_embed_mode=adaLN")
+            conditions.append(aspect)
+
+        condition = combine_adaln_conditions(
+            conditions,
+            expand_instance_eager=self.args.expand_instance_eager,
+        )
+        gathered = condition.gather_at(layout.diffusion_target_idx)
+        if self.diffusion_modulation_proj is not None:
+            if condition.granularity.name == "GLOBAL":
+                projected = self.diffusion_modulation_proj(condition.embedding)
+                return projected.squeeze(0)
+            projected = self.diffusion_modulation_proj(condition.embedding)
+            condition = WLAMCondition(projected, condition.granularity, condition.instance_ids)
+            gathered = condition.gather_at(layout.diffusion_target_idx)
+        return gathered
+
     def _build_embeddings(
         self,
         input_ids: torch.Tensor,
@@ -403,6 +506,55 @@ class WLAMARModel(nn.Module):
             ).to(device=device, dtype=dtype)
             hidden_states[layout.diffusion_latent_idx] = self.diffusion_projection(vae_latents)
 
+        if layout.time_embed_idx.numel() > 0:
+            if self.args.time_embed_mode != WLAMTimeEmbedMode.IN_CONTEXT.value:
+                raise ValueError("DIFFUSION_TIME tokens require time_embed_mode=in_context")
+            time_cond = self._scalar_condition(
+                kwargs,
+                runtime,
+                "timestep",
+                "time_instance_ids",
+                self.diffusion_time_embedder,
+                device=device,
+                dtype=dtype,
+            )
+            if time_cond is None:
+                raise ValueError("timestep is required for DIFFUSION_TIME tokens")
+            hidden_states[layout.time_embed_idx] = time_cond.gather_at(layout.time_embed_idx).to(dtype=dtype)
+
+        if self.args.use_aspect_ratio_cond and self.args.metadata_embed_mode == WLAMTimeEmbedMode.IN_CONTEXT.value:
+            if self.aspect_ratio_embedder is None:
+                raise ValueError("aspect ratio conditioning requested without aspect_ratio_embedder")
+            aspect_idx = layout.metadata_embed_indices.get(int(WLAMTokenType.ASPECT_RATIO))
+            if aspect_idx is not None and aspect_idx.numel() > 0:
+                aspect_cond = self._scalar_condition(
+                    kwargs,
+                    runtime,
+                    "aspect_ratio",
+                    "aspect_ratio_instance_ids",
+                    self.aspect_ratio_embedder,
+                    device=device,
+                    dtype=dtype,
+                )
+                if aspect_cond is None:
+                    raise ValueError("aspect_ratio is required for ASPECT_RATIO tokens")
+                hidden_states[aspect_idx] = aspect_cond.gather_at(aspect_idx).to(dtype=dtype)
+
+        if self.args.metadata_embed_mode == WLAMTimeEmbedMode.ADDITION.value:
+            if self.args.use_aspect_ratio_cond and self.aspect_ratio_embedder is not None:
+                aspect_cond = self._scalar_condition(
+                    kwargs,
+                    runtime,
+                    "aspect_ratio",
+                    "aspect_ratio_instance_ids",
+                    self.aspect_ratio_embedder,
+                    device=device,
+                    dtype=dtype,
+                )
+                if aspect_cond is None:
+                    raise ValueError("aspect_ratio is required when metadata_embed_mode=addition")
+                hidden_states = aspect_cond.add_to_target_at(hidden_states, layout.diffusion_latent_idx)
+
         return hidden_states
 
     def forward(
@@ -418,10 +570,41 @@ class WLAMARModel(nn.Module):
         runtime = model_intermediate_buffer or runtime_additional_information
         token_type_ids = self._build_token_type_ids(input_ids, runtime)
         position_ids = self._build_position_ids(positions, runtime)
-        layout = WLAMTokenLayout.from_token_type_ids(token_type_ids)
+        metadata_token_types = (
+            [int(WLAMTokenType.ASPECT_RATIO)]
+            if self.args.use_aspect_ratio_cond and self.args.metadata_embed_mode == WLAMTimeEmbedMode.IN_CONTEXT.value
+            else None
+        )
+        layout = WLAMTokenLayout.from_token_type_ids(
+            token_type_ids,
+            metadata_token_types=metadata_token_types,
+        )
         hidden_states = self._build_embeddings(input_ids, inputs_embeds, layout, runtime, kwargs)
+        adaln_condition = None
+        if self.args.time_embed_mode == WLAMTimeEmbedMode.ADALN.value:
+            adaln_condition = self._build_adaln_condition(
+                layout,
+                runtime,
+                kwargs,
+                device=input_ids.device,
+                dtype=hidden_states.dtype,
+            )
+        elif self.args.time_embed_mode == WLAMTimeEmbedMode.ADDITION.value:
+            time_cond = self._scalar_condition(
+                kwargs,
+                runtime,
+                "timestep",
+                "time_instance_ids",
+                self.diffusion_time_embedder,
+                device=input_ids.device,
+                dtype=hidden_states.dtype,
+            )
+            if time_cond is None and layout.diffusion_target_idx.numel() > 0:
+                raise ValueError("timestep is required when time_embed_mode=addition and diffusion targets are present")
+            if time_cond is not None:
+                hidden_states = time_cond.add_to_target_at(hidden_states, layout.diffusion_target_idx)
         for layer in self.layers:
-            hidden_states = layer(hidden_states, position_ids, layout)
+            hidden_states = layer(hidden_states, position_ids, layout, adaln_condition)
         return self.norm(hidden_states)
 
 

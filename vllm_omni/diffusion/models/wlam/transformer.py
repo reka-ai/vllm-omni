@@ -1,26 +1,29 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import Any
 
 import torch
 import torch.nn as nn
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.model_executor.models.wlam.common_layers import (
+    WLAMAdaLN,
+    WLAMDiffusionHead,
+    WLAMSwiGLUMLP,
+    as_tensor,
+    gate_residual_update,
+    t2i_modulate,
+)
 from vllm_omni.model_executor.models.wlam.common import WLAMModelArgs
+from vllm_omni.model_executor.models.wlam.conditioning import WLAMSinusoidalEmbedder
 from vllm_omni.model_executor.models.wlam.rope import WLAMMultimodalRotaryEmbedding
 
 
 def _as_tensor(x: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]) -> torch.Tensor:
-    return x[0] if isinstance(x, tuple) else x
+    return as_tensor(x)
 
 
 def _cache_tensor(cache: Any, layer_idx: int, attr: str) -> torch.Tensor:
@@ -30,29 +33,6 @@ def _cache_tensor(cache: Any, layer_idx: int, attr: str) -> torch.Tensor:
     if value is None:
         raise ValueError(f"past_key_values.{attr}[{layer_idx}] is empty")
     return value
-
-
-class WLAMDiffusionMLP(nn.Module):
-    def __init__(self, args: WLAMModelArgs, *, prefix: str = "") -> None:
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            input_size=args.hidden_size,
-            output_sizes=[args.intermediate_size, args.intermediate_size],
-            bias=False,
-            return_bias=False,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-        self.down_proj = RowParallelLinear(
-            input_size=args.intermediate_size,
-            output_size=args.hidden_size,
-            bias=False,
-            return_bias=False,
-            prefix=f"{prefix}.down_proj",
-        )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _as_tensor(self.down_proj(self.act_fn(_as_tensor(self.gate_up_proj(x)))))
 
 
 class WLAMDiffusionAttention(nn.Module):
@@ -90,6 +70,7 @@ class WLAMDiffusionAttention(nn.Module):
             self.head_dim,
             args.mrope_section or [2, 2, 31, 31],
             base=args.rope_theta,
+            mode=args.mrope_freq_mode,
         )
         self.attn = Attention(
             num_heads=self.qkv_proj.num_heads,
@@ -145,8 +126,12 @@ class WLAMDiffusionLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.self_attn = WLAMDiffusionAttention(args, layer_idx=layer_idx, prefix=f"{prefix}.self_attn")
-        self.mlp = WLAMDiffusionMLP(args, prefix=f"{prefix}.mlp_diffusion")
-        self.modulation = nn.Linear(args.hidden_size, 6 * args.hidden_size) if args.use_time_modulation else None
+        self.mlp = WLAMSwiGLUMLP(
+            args.hidden_size,
+            args.diffusion_intermediate_size or args.intermediate_size,
+            prefix=f"{prefix}.mlp_diffusion",
+        )
+        self.modulation = WLAMAdaLN(args.hidden_size) if args.use_time_modulation else None
 
     def forward(
         self,
@@ -155,40 +140,45 @@ class WLAMDiffusionLayer(nn.Module):
         past_key_values: Any | None,
         condition: torch.Tensor | None,
     ) -> torch.Tensor:
-        shift_msa = scale_msa = gate_msa = shift_mlp = scale_mlp = gate_mlp = None
+        modulation = None
         if self.modulation is not None:
             if condition is None:
                 raise ValueError("condition is required when use_time_modulation=True")
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.modulation(condition).chunk(6, dim=-1)
+            modulation = self.modulation(condition)
 
         residual = hidden_states
         normed = self.input_layernorm(hidden_states)
-        if shift_msa is not None:
-            normed = normed * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        if modulation is not None:
+            normed = t2i_modulate(normed, modulation.shift_msa, modulation.scale_msa)
         attn_out = self.self_attn(normed, position_ids, past_key_values)
-        if gate_msa is not None:
-            attn_out = attn_out * gate_msa[:, None]
+        if modulation is not None:
+            attn_out = gate_residual_update(attn_out, modulation.gate_msa)
         hidden_states = residual + attn_out
 
         residual = hidden_states
         normed = self.post_attention_layernorm(hidden_states)
-        if shift_mlp is not None:
-            normed = normed * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        if modulation is not None:
+            normed = t2i_modulate(normed, modulation.shift_mlp, modulation.scale_mlp)
         mlp_out = self.mlp(normed)
-        if gate_mlp is not None:
-            mlp_out = mlp_out * gate_mlp[:, None]
+        if modulation is not None:
+            mlp_out = gate_residual_update(mlp_out, modulation.gate_mlp)
         return residual + mlp_out
 
 
 class WLAMDiffusionTransformer(nn.Module):
     def __init__(self, args: WLAMModelArgs) -> None:
         super().__init__()
-        self.args = replace(args, use_dual_attn_weights=True, use_dual_mlp_weights=True)
-        self.latent_projection = nn.Linear(args.visual_latent_dim, args.hidden_size)
-        self.time_projection = nn.Sequential(
+        self.args = args
+        self.latent_projection = nn.Sequential(
+            nn.Linear(args.visual_latent_dim, args.hidden_size),
+            nn.GELU(),
             nn.Linear(args.hidden_size, args.hidden_size),
+        )
+        self.time_embedder = WLAMSinusoidalEmbedder(args.hidden_size)
+        self.time_projection = nn.Sequential(
             nn.SiLU(),
             nn.Linear(args.hidden_size, args.hidden_size),
+            nn.SiLU(),
         )
         self.layers = nn.ModuleList(
             [
@@ -201,18 +191,45 @@ class WLAMDiffusionTransformer(nn.Module):
             ]
         )
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.output_projection = nn.Linear(args.hidden_size, args.visual_latent_dim)
+        self.diffusion_extra_layers = nn.ModuleList(
+            [
+                WLAMDiffusionLayer(
+                    self.args,
+                    layer_idx=args.num_hidden_layers + i,
+                    prefix=f"transformer.diffusion_extra_layers.{i}",
+                )
+                for i in range(args.num_diffusion_extra_layers)
+            ]
+        )
+        self.diffusion_extra_norm = (
+            nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+            if args.num_diffusion_extra_layers > 0
+            else None
+        )
+        self.diffusion_head = WLAMDiffusionHead(
+            args.hidden_size,
+            args.visual_latent_dim,
+            use_adaLN=args.diffusion_head_adaLN,
+            eps=args.rms_norm_eps,
+        )
 
     def forward(
         self,
         target_latents: torch.Tensor,
         position_ids: torch.Tensor,
-        timestep_emb: torch.Tensor,
+        timestep: torch.Tensor,
         *,
         past_key_values: Any | None,
     ) -> torch.Tensor:
         hidden_states = self.latent_projection(target_latents)
-        condition = self.time_projection(timestep_emb)
+        condition = self.time_projection(self.time_embedder(timestep, dtype=target_latents.dtype))
         for layer in self.layers:
             hidden_states = layer(hidden_states, position_ids, past_key_values, condition)
-        return self.output_projection(self.norm(hidden_states))
+        hidden_states = self.norm(hidden_states)
+        if self.diffusion_extra_layers:
+            for layer in self.diffusion_extra_layers:
+                hidden_states = layer(hidden_states, position_ids, None, condition)
+            if self.diffusion_extra_norm is None:
+                raise ValueError("diffusion_extra_norm is required when diffusion_extra_layers are present")
+            hidden_states = self.diffusion_extra_norm(hidden_states)
+        return self.diffusion_head(hidden_states, condition)
