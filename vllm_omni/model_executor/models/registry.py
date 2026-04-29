@@ -179,6 +179,11 @@ _OMNI_MODELS = {
         "marey_text_encoder",
         "MareyTextEncoder",
     ),
+    "WLAMForConditionalGeneration": (
+        "wlam",
+        "wlam",
+        "WLAMForConditionalGeneration",
+    ),
 }
 
 
