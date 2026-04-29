@@ -98,8 +98,8 @@ class DiffusionEngine:
         self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
 
         try:
-            # self._dummy_run()
-            pass
+            self._dummy_run()
+            # pass
         except Exception as e:
             logger.error(f"Dummy run failed: {e}")
             self.close()

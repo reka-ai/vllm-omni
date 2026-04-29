@@ -198,6 +198,16 @@ _DIFFUSION_MODELS = {
         "pipeline_marey_vae",
         "MareyVaePipeline",
     ),
+    "WLAMDiffusionPipeline": (
+        "wlam",
+        "pipeline_wlam",
+        "WLAMDiffusionPipeline",
+    ),
+    "WLAMVaePipeline": (
+        "wlam",
+        "pipeline_wlam_vae",
+        "WLAMVaePipeline",
+    ),
 }
 
 

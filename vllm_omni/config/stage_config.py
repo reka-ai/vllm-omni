@@ -238,6 +238,7 @@ class StageConfigFactory:
         "glm-image": "glm_image",
         "cosyvoice3": "cosyvoice3",
         "mammothmoda2": "mammoth_moda2",
+        "wlam": "wlam",
     }
 
     # Fallback: map HF architecture class names to pipeline dirs.
@@ -246,6 +247,7 @@ class StageConfigFactory:
     _ARCHITECTURE_MODELS: dict[str, str] = {
         "MiMoAudioForConditionalGeneration": "mimo_audio",
         "HunyuanImage3ForCausalMM": "hunyuan_image3",
+        "WLAMForConditionalGeneration": "wlam",
     }
 
     @classmethod
